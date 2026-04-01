@@ -69,8 +69,8 @@ The private Binboi product repository can depend on this engine, embed it, wrap 
 
 ## Development Notes
 
-- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, and basic concurrent HTTP request forwarding.
-- The forwarding layer is intentionally minimal for now: no streaming bodies, no chunked transport, and no advanced multiplex framing yet.
+- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, and framed body streaming.
+- The forwarding layer is still intentionally modest: request and response bodies now move as framed chunks, but advanced flow control, websocket tunneling, and binary framing are still future work.
 - The codebase favors standard library dependencies to keep the engine portable and easy to audit.
 - Folder-level README files are included to make each major area understandable on first read.
 

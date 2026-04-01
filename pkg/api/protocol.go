@@ -11,15 +11,19 @@ import (
 type MessageType string
 
 const (
-	MessageTypeRegister   MessageType = "register"
-	MessageTypeRegistered MessageType = "registered"
-	MessageTypePing       MessageType = "ping"
-	MessageTypePong       MessageType = "pong"
-	MessageTypeRequest    MessageType = "request"
-	MessageTypeResponse   MessageType = "response"
-	MessageTypeCancel     MessageType = "cancel"
-	MessageTypeError      MessageType = "error"
-	MessageTypeClose      MessageType = "close"
+	MessageTypeRegister      MessageType = "register"
+	MessageTypeRegistered    MessageType = "registered"
+	MessageTypePing          MessageType = "ping"
+	MessageTypePong          MessageType = "pong"
+	MessageTypeRequestStart  MessageType = "request_start"
+	MessageTypeRequestBody   MessageType = "request_body"
+	MessageTypeRequestEnd    MessageType = "request_end"
+	MessageTypeRequestCancel MessageType = "request_cancel"
+	MessageTypeResponseStart MessageType = "response_start"
+	MessageTypeResponseBody  MessageType = "response_body"
+	MessageTypeResponseEnd   MessageType = "response_end"
+	MessageTypeError         MessageType = "error"
+	MessageTypeClose         MessageType = "close"
 )
 
 // Message is the generic JSON envelope exchanged over the stream control plane.
@@ -72,24 +76,32 @@ type PongPayload struct {
 	ReceivedAt time.Time `json:"received_at"`
 }
 
-// RequestPayload asks the client to proxy an HTTP request to the local service.
-type RequestPayload struct {
+const DefaultBodyChunkSize = 32 * 1024
+
+// RequestStartPayload describes an incoming HTTP request before body frames arrive.
+type RequestStartPayload struct {
 	Method  string              `json:"method"`
 	Path    string              `json:"path"`
 	Host    string              `json:"host,omitempty"`
 	Headers map[string][]string `json:"headers,omitempty"`
-	Body    string              `json:"body,omitempty"`
 }
 
-// ResponsePayload returns the local service's HTTP response.
-type ResponsePayload struct {
+// BodyChunkPayload carries a body chunk for a request or response stream.
+type BodyChunkPayload struct {
+	Chunk []byte `json:"chunk,omitempty"`
+}
+
+// StreamEndPayload marks the end of a framed request or response body stream.
+type StreamEndPayload struct{}
+
+// ResponseStartPayload describes the upstream response before body frames arrive.
+type ResponseStartPayload struct {
 	Status  int                 `json:"status"`
 	Headers map[string][]string `json:"headers,omitempty"`
-	Body    string              `json:"body,omitempty"`
 }
 
-// CancelPayload prepares the protocol for future request cancellation support.
-type CancelPayload struct {
+// RequestCancelPayload cancels an in-flight request stream.
+type RequestCancelPayload struct {
 	Reason string `json:"reason,omitempty"`
 }
 

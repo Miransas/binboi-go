@@ -52,6 +52,9 @@ type TunnelSession struct {
 	heartbeatInterval time.Duration
 	httpClient        *http.Client
 	closeConn         func()
+	sendMu            sync.Mutex
+	activeMu          sync.Mutex
+	active            map[string]*activeRequest
 }
 
 // NewTunnel creates a client for the daemon's stream control listener.
@@ -151,6 +154,7 @@ func (c *TunnelClient) Connect(ctx context.Context, payload api.RegisterPayload)
 				Timeout: 30 * time.Second,
 			},
 			closeConn: closeConn,
+			active:    make(map[string]*activeRequest),
 		}, nil
 	case api.MessageTypeError:
 		var protocolErr api.ProtocolErrorPayload
@@ -263,6 +267,7 @@ func (s *TunnelSession) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer s.closeConn()
+	defer s.cancelActiveRequests(context.Canceled)
 
 	heartbeatErrCh := make(chan error, 1)
 
@@ -331,16 +336,46 @@ func (s *TunnelSession) Run(ctx context.Context) error {
 				"reason", closePayload.Reason,
 			)
 			return nil
-		case api.MessageTypeRequest:
-			var request api.RequestPayload
-			if err := message.Decode(&request); err != nil {
+		case api.MessageTypeRequestStart:
+			var start api.RequestStartPayload
+			if err := message.Decode(&start); err != nil {
 				return err
 			}
 			if message.ID == "" {
-				return errors.New("request message missing id")
+				return errors.New("request_start missing id")
 			}
-
-			go s.handleRequest(ctx, message.ID, request)
+			if err := s.handleRequestStart(ctx, message.ID, start); err != nil {
+				return err
+			}
+		case api.MessageTypeRequestBody:
+			var body api.BodyChunkPayload
+			if err := message.Decode(&body); err != nil {
+				return err
+			}
+			if message.ID == "" {
+				return errors.New("request_body missing id")
+			}
+			if err := s.handleRequestBody(message.ID, body.Chunk); err != nil {
+				return err
+			}
+		case api.MessageTypeRequestEnd:
+			if message.ID == "" {
+				return errors.New("request_end missing id")
+			}
+			if err := s.handleRequestEnd(message.ID); err != nil {
+				return err
+			}
+		case api.MessageTypeRequestCancel:
+			var cancelPayload api.RequestCancelPayload
+			if message.Payload != nil {
+				if err := message.Decode(&cancelPayload); err != nil {
+					return err
+				}
+			}
+			if message.ID == "" {
+				return errors.New("request_cancel missing id")
+			}
+			s.handleRequestCancel(message.ID, cancelPayload)
 		default:
 			s.logger.Warn("ignoring unexpected control message",
 				"tunnel_id", s.registered.TunnelID,
@@ -348,6 +383,16 @@ func (s *TunnelSession) Run(ctx context.Context) error {
 			)
 		}
 	}
+}
+
+func (s *TunnelSession) sendMessage(message api.Message) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
+	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	return s.codec.Send(message)
 }
 
 func (s *TunnelSession) heartbeatLoop(ctx context.Context) error {

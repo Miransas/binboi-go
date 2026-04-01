@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -174,20 +175,14 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	request, err := requestFromHTTP(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
-		return
-	}
-
 	host := normalizeHost(r.Host)
 	s.logger.Info("incoming tunneled request",
 		"host", host,
-		"method", request.Method,
-		"path", request.Path,
+		"method", r.Method,
+		"path", r.URL.RequestURI(),
 	)
 
-	response, err := s.protocolServer.ForwardRequest(r.Context(), host, request)
+	pending, err := s.protocolServer.ForwardRequest(r.Context(), host, r)
 	if err != nil {
 		switch {
 		case errors.Is(err, errTunnelNotFound):
@@ -203,8 +198,8 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		default:
 			s.logger.Warn("failed to forward request",
 				"host", host,
-				"method", request.Method,
-				"path", request.Path,
+				"method", r.Method,
+				"path", r.URL.RequestURI(),
 				"error", err,
 			)
 			writeError(w, http.StatusBadGateway, "failed to forward tunneled request")
@@ -212,13 +207,52 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start, err := pending.waitForResponseStart(r.Context())
+	if err != nil {
+		switch {
+		case errors.Is(err, errTunnelUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "tunnel disconnected before response_start")
+		case errors.Is(err, context.DeadlineExceeded):
+			writeError(w, http.StatusGatewayTimeout, "tunnel response timed out")
+		case errors.Is(err, context.Canceled):
+			writeError(w, http.StatusGatewayTimeout, "client closed request")
+		default:
+			writeError(w, http.StatusBadGateway, "failed before response_start")
+		}
+		return
+	}
+
+	for key, values := range start.Headers {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(start.Status)
+
+	if _, err := io.Copy(w, pending.bodyReader); err != nil && !errors.Is(err, context.Canceled) {
+		s.logger.Warn("response body stream copy failed",
+			"host", host,
+			"method", r.Method,
+			"path", r.URL.RequestURI(),
+			"error", err,
+		)
+	}
+
+	if err := pending.waitForDone(r.Context()); err != nil && !errors.Is(err, context.Canceled) {
+		s.logger.Warn("response stream completed with error",
+			"host", host,
+			"method", r.Method,
+			"path", r.URL.RequestURI(),
+			"error", err,
+		)
+	}
+
 	s.logger.Info("sending tunneled response",
 		"host", host,
-		"method", request.Method,
-		"path", request.Path,
-		"status", response.Status,
+		"method", r.Method,
+		"path", r.URL.RequestURI(),
+		"status", start.Status,
 	)
-	writeForwardedHTTPResponse(w, response)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

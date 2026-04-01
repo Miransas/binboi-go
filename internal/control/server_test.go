@@ -218,9 +218,11 @@ func TestHTTPForwardingConcurrentRequests(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			req := httptest.NewRequest(http.MethodPost, "http://"+publicHost+path, strings.NewReader("hello from request"))
+			requestBody := strings.Repeat("hello-from-request-", 4096)
+			req := httptest.NewRequest(http.MethodPost, "http://"+publicHost+path, strings.NewReader(requestBody))
 			req.Host = publicHost
 			req.Header.Set("X-Test-Header", "binboi")
+			req.Header.Set("X-Response-Bytes", "131072")
 
 			recorder := httptest.NewRecorder()
 			server.Handler().ServeHTTP(recorder, req)
@@ -239,6 +241,9 @@ func TestHTTPForwardingConcurrentRequests(t *testing.T) {
 		}
 		if !strings.Contains(recorder.Body.String(), paths[i]) {
 			t.Fatalf("response body missing path for request %d: %q", i, recorder.Body.String())
+		}
+		if len(recorder.Body.String()) < 131072 {
+			t.Fatalf("expected large streamed response body for request %d, got %d bytes", i, len(recorder.Body.String()))
 		}
 	}
 
@@ -347,6 +352,100 @@ func TestPendingRequestsFailOnDisconnect(t *testing.T) {
 	}
 }
 
+func TestRequestCancellationPropagatesToUpstream(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+	server := NewServer(ServerConfig{
+		HTTPAddress:       ":0",
+		ProtocolAddress:   "127.0.0.1:0",
+		HeartbeatInterval: time.Second,
+		Name:              "binboid",
+		Version:           "test",
+	}, logger, manager)
+
+	upstreamURL, upstreamCanceled, shutdownUpstream := startCancelableUpstreamServer(t)
+	defer shutdownUpstream()
+
+	localURL, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+
+	localPort, err := portFromHost(localURL.Host)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.protocolServer.Run(ctx)
+	}()
+
+	address := waitForAddress(t, server.protocolServer)
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: localPort,
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err != nil {
+		t.Fatalf("connect tunnel client: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	publicHost := hostNameFromPublicURL(tunnelSession.Registered().PublicURL)
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "http://"+publicHost+"/cancel", strings.NewReader(strings.Repeat("cancel-me-", 2048))).WithContext(reqCtx)
+	req.Host = publicHost
+
+	respCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, req)
+		respCh <- recorder
+	}()
+
+	waitForInFlightAtLeast(t, manager, tunnelSession.Registered().TunnelID, 1)
+	reqCancel()
+
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+
+	recorder := <-respCh
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected canceled request to return 504, got %d", recorder.Code)
+	}
+
+	waitForInFlight(t, manager, tunnelSession.Registered().TunnelID, 0)
+
+	stop()
+	_ = <-runDone
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
 func waitForAddress(t *testing.T, stream *protocolServer) string {
 	t.Helper()
 
@@ -437,6 +536,11 @@ func startUpstreamHTTPServer(t *testing.T, delay time.Duration) (string, func())
 		w.Header().Set("X-Upstream-Service", "http-basic-test")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, r.URL.RequestURI()+"|"+string(body))
+		if size := r.Header.Get("X-Response-Bytes"); size != "" {
+			if n, err := strconv.Atoi(size); err == nil && n > 0 {
+				_, _ = io.WriteString(w, strings.Repeat("r", n))
+			}
+		}
 	})
 
 	server := &http.Server{Handler: mux}
@@ -445,6 +549,34 @@ func startUpstreamHTTPServer(t *testing.T, delay time.Duration) (string, func())
 	}()
 
 	return "http://" + listener.Addr().String(), func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}
+}
+
+func startCancelableUpstreamServer(t *testing.T) (string, <-chan struct{}, func()) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen cancelable upstream server: %v", err)
+	}
+
+	canceled := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		<-r.Context().Done()
+		canceled <- struct{}{}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+
+	return "http://" + listener.Addr().String(), canceled, func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)

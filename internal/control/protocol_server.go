@@ -87,29 +87,29 @@ func (s *protocolServer) Address() string {
 	return s.listener.Addr().String()
 }
 
-func (s *protocolServer) ForwardRequest(ctx context.Context, host string, request api.RequestPayload) (api.ResponsePayload, error) {
+func (s *protocolServer) ForwardRequest(ctx context.Context, host string, request *http.Request) (*pendingRequest, error) {
 	host = normalizeHost(host)
 	if host == "" {
-		return api.ResponsePayload{}, errTunnelNotFound
+		return nil, errTunnelNotFound
 	}
 
 	sessionState, ok := s.manager.LookupByHost(host)
 	if !ok {
-		return api.ResponsePayload{}, errTunnelNotFound
+		return nil, errTunnelNotFound
 	}
 	if sessionState.Connection != "connected" {
-		return api.ResponsePayload{}, errTunnelUnavailable
+		return nil, errTunnelUnavailable
 	}
 	if sessionState.Protocol != "http" && sessionState.Protocol != "https" {
-		return api.ResponsePayload{}, errTunnelUnsupported
+		return nil, errTunnelUnsupported
 	}
 
 	peer := s.peerBySessionID(sessionState.ID)
 	if peer == nil {
-		return api.ResponsePayload{}, errTunnelUnavailable
+		return nil, errTunnelUnavailable
 	}
 
-	return peer.forward(ctx, request)
+	return peer.forwardHTTP(ctx, request)
 }
 
 func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
@@ -290,24 +290,79 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 				s.logger.Warn("failed to send pong", "tunnel_id", sessionID, "error", err)
 				return
 			}
-		case api.MessageTypeResponse:
-			var response api.ResponsePayload
-			if err := message.Decode(&response); err != nil {
+		case api.MessageTypeResponseStart:
+			var responseStart api.ResponseStartPayload
+			if err := message.Decode(&responseStart); err != nil {
 				s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
-				return
+				continue
 			}
-			if message.ID == "" || !peer.handleResponse(message.ID, response) {
-				s.logger.Warn("received response for unknown or expired request",
+			if message.ID == "" {
+				s.sendProtocolError(conn, codec, "", "malformed_payload", "response_start missing id")
+				continue
+			}
+			if err := peer.handleResponseStart(message.ID, responseStart); err != nil {
+				s.logger.Warn("received invalid response_start",
 					"tunnel_id", sessionID,
 					"request_id", message.ID,
+					"error", err,
 				)
+				s.sendProtocolError(conn, codec, message.ID, "invalid_frame_order", err.Error())
 				continue
 			}
 
-			s.logger.Info("received forwarded response",
+			s.logger.Info("received response_start",
 				"tunnel_id", sessionID,
 				"request_id", message.ID,
-				"status", response.Status,
+				"status", responseStart.Status,
+			)
+		case api.MessageTypeResponseBody:
+			var body api.BodyChunkPayload
+			if err := message.Decode(&body); err != nil {
+				s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
+				continue
+			}
+			if message.ID == "" {
+				s.sendProtocolError(conn, codec, "", "malformed_payload", "response_body missing id")
+				continue
+			}
+			if err := peer.handleResponseBody(message.ID, body.Chunk); err != nil {
+				s.logger.Warn("received invalid response_body",
+					"tunnel_id", sessionID,
+					"request_id", message.ID,
+					"error", err,
+				)
+				s.sendProtocolError(conn, codec, message.ID, "invalid_frame_order", err.Error())
+				continue
+			}
+			s.logger.Debug("received response_body chunk",
+				"tunnel_id", sessionID,
+				"request_id", message.ID,
+				"chunk_size", len(body.Chunk),
+			)
+		case api.MessageTypeResponseEnd:
+			if message.Payload != nil {
+				var end api.StreamEndPayload
+				if err := message.Decode(&end); err != nil {
+					s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
+					continue
+				}
+			}
+			if message.ID == "" {
+				s.sendProtocolError(conn, codec, "", "malformed_payload", "response_end missing id")
+				continue
+			}
+			if err := peer.handleResponseEnd(message.ID); err != nil {
+				s.logger.Warn("received invalid response_end",
+					"tunnel_id", sessionID,
+					"request_id", message.ID,
+					"error", err,
+				)
+				s.sendProtocolError(conn, codec, message.ID, "invalid_frame_order", err.Error())
+				continue
+			}
+			s.logger.Debug("received response_end",
+				"tunnel_id", sessionID,
+				"request_id", message.ID,
 			)
 		case api.MessageTypeError:
 			var protocolErr api.ProtocolErrorPayload
@@ -403,14 +458,4 @@ func (s *protocolServer) sendProtocolError(conn net.Conn, codec *api.MessageCode
 	if err := codec.Send(protocolMessage); err != nil {
 		s.logger.Warn("failed to send protocol error", "code", code, "error", err)
 	}
-}
-
-func writeForwardedHTTPResponse(w http.ResponseWriter, response api.ResponsePayload) {
-	for key, values := range response.Headers {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(response.Status)
-	_, _ = io.WriteString(w, response.Body)
 }
