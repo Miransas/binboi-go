@@ -46,6 +46,7 @@ type ResumeResult struct {
 
 type record struct {
 	session     api.Session
+	tunnel      tunnel.Record
 	conn        net.Conn
 	remoteAddr  string
 	userID      string
@@ -57,22 +58,35 @@ type record struct {
 
 // Manager stores session state and prepares public session metadata.
 type Manager struct {
-	mu       sync.RWMutex
-	engine   *tunnel.Engine
-	planner  *proxy.Planner
-	sessions map[string]*record
-	byHost   map[string]string
-	byResume map[string]string
+	mu                sync.RWMutex
+	engine            *tunnel.Engine
+	planner           *proxy.Planner
+	store             *tunnel.Store
+	sessions          map[string]*record
+	byHost            map[string]string
+	bySubdomain       map[string]string
+	activeByHost      map[string]string
+	activeBySubdomain map[string]string
+	byResume          map[string]string
 }
 
 // NewManager creates an in-memory session manager.
 func NewManager(publicHost, forwardedHeader string) *Manager {
+	return NewManagerWithStore(publicHost, forwardedHeader, nil)
+}
+
+// NewManagerWithStore creates a session manager with optional durable tunnel storage.
+func NewManagerWithStore(publicHost, forwardedHeader string, store *tunnel.Store) *Manager {
 	return &Manager{
-		engine:   tunnel.NewEngine(publicHost),
-		planner:  proxy.NewPlanner(forwardedHeader),
-		sessions: make(map[string]*record),
-		byHost:   make(map[string]string),
-		byResume: make(map[string]string),
+		engine:            tunnel.NewEngine(publicHost),
+		planner:           proxy.NewPlanner(forwardedHeader),
+		store:             store,
+		sessions:          make(map[string]*record),
+		byHost:            make(map[string]string),
+		bySubdomain:       make(map[string]string),
+		activeByHost:      make(map[string]string),
+		activeBySubdomain: make(map[string]string),
+		byResume:          make(map[string]string),
 	}
 }
 
@@ -173,9 +187,14 @@ func (m *Manager) resumeTunnel(req RegisterRequest) (api.Session, error) {
 	record.session.Status = "connected"
 	record.session.Connection = "connected"
 	record.session.UserID = req.UserID
+	record.session.TokenID = req.TokenID
 	record.session.LastSeen = &now
 	record.session.LastHeartbeat = &now
+	record.tunnel.Status = "connected"
+	record.tunnel.LastSeen = cloneTimePtr(&now)
+	m.activateRoutingLocked(record.session.ID, record.session.PublicURL, record.session.Subdomain)
 
+	_ = m.persistTunnelLocked(record)
 	return cloneSession(record.session), nil
 }
 
@@ -196,6 +215,10 @@ func (m *Manager) DetachConnection(sessionID string, at time.Time) {
 	record.session.Status = "disconnected"
 	record.session.LastSeen = &timestamp
 	record.session.InFlight = 0
+	record.tunnel.Status = "disconnected"
+	record.tunnel.LastSeen = cloneTimePtr(&timestamp)
+	m.deactivateRoutingLocked(record.session.ID, record.session.PublicURL, record.session.Subdomain)
+	_ = m.persistTunnelLocked(record)
 }
 
 // TouchHeartbeat updates the last-seen heartbeat for a live session.
@@ -213,6 +236,10 @@ func (m *Manager) TouchHeartbeat(sessionID string, at time.Time) error {
 	record.session.LastSeen = &timestamp
 	record.session.Status = "connected"
 	record.session.Connection = "connected"
+	record.tunnel.Status = "connected"
+	record.tunnel.LastSeen = cloneTimePtr(&timestamp)
+	m.activateRoutingLocked(record.session.ID, record.session.PublicURL, record.session.Subdomain)
+	_ = m.persistTunnelLocked(record)
 	return nil
 }
 
@@ -233,7 +260,22 @@ func (m *Manager) LookupByHost(host string) (api.Session, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sessionID, ok := m.byHost[host]
+	sessionID, ok := m.activeByHost[host]
+	if !ok {
+		subdomain := tunnel.ExtractSubdomain(host, m.engine.PublicHost())
+		if subdomain != "" {
+			sessionID, ok = m.activeBySubdomain[subdomain]
+		}
+	}
+	if !ok {
+		sessionID, ok = m.byHost[host]
+	}
+	if !ok {
+		subdomain := tunnel.ExtractSubdomain(host, m.engine.PublicHost())
+		if subdomain != "" {
+			sessionID, ok = m.bySubdomain[subdomain]
+		}
+	}
 	if !ok {
 		return api.Session{}, false
 	}
@@ -292,6 +334,7 @@ type sessionParams struct {
 	userID        string
 	tokenID       string
 	tokenPrefix   string
+	subdomain     string
 	metadata      api.ClientMetadata
 	createdAt     time.Time
 }
@@ -307,7 +350,11 @@ func (m *Manager) storeSession(target transport.Target, params sessionParams) (a
 	}
 
 	route := m.planner.Plan(target, sessionID)
-	descriptor := m.engine.Prepare(sessionID, params.name, target.Protocol, route)
+	subdomain, err := m.allocateSubdomain(params.subdomain)
+	if err != nil {
+		return api.Session{}, err
+	}
+	descriptor := m.engine.Prepare(sessionID, params.name, subdomain, target.Protocol, route)
 
 	createdAt := params.createdAt
 	if createdAt.IsZero() {
@@ -318,6 +365,8 @@ func (m *Manager) storeSession(target transport.Target, params sessionParams) (a
 		ID:            sessionID,
 		Name:          params.name,
 		UserID:        params.userID,
+		TokenID:       params.tokenID,
+		Subdomain:     descriptor.Subdomain,
 		Protocol:      target.Protocol,
 		Target:        target.URL.String(),
 		LocalPort:     params.localPort,
@@ -343,13 +392,24 @@ func (m *Manager) storeSession(target transport.Target, params sessionParams) (a
 			if existing.session.Connection == "connected" {
 				return api.Session{}, fmt.Errorf("public host %q is already connected", host)
 			}
-			delete(m.byResume, existing.resumeToken)
-			delete(m.sessions, existingID)
+			m.removeSessionLocked(existingID, existing)
 		}
 	}
 
-	m.sessions[session.ID] = &record{
-		session:     session,
+	record := &record{
+		session: session,
+		tunnel: tunnel.Record{
+			ID:        session.ID,
+			UserID:    params.userID,
+			TokenID:   params.tokenID,
+			Subdomain: descriptor.Subdomain,
+			Protocol:  target.Protocol,
+			Port:      params.localPort,
+			Status:    params.status,
+			PublicURL: descriptor.PublicURL,
+			CreatedAt: createdAt,
+			LastSeen:  cloneTimePtr(params.lastSeen),
+		},
 		conn:        params.conn,
 		remoteAddr:  params.remoteAddr,
 		userID:      params.userID,
@@ -358,12 +418,31 @@ func (m *Manager) storeSession(target transport.Target, params sessionParams) (a
 		metadata:    params.metadata,
 		resumeToken: resumeToken,
 	}
+	m.sessions[session.ID] = record
 	if host != "" {
 		m.byHost[host] = session.ID
 	}
+	if descriptor.Subdomain != "" {
+		m.bySubdomain[descriptor.Subdomain] = session.ID
+	}
+	if session.Connection == "connected" {
+		m.activateRoutingLocked(session.ID, session.PublicURL, session.Subdomain)
+	}
 	m.byResume[resumeToken] = session.ID
+	if err := m.persistTunnelLocked(record); err != nil {
+		m.removeSessionLocked(session.ID, record)
+		return api.Session{}, err
+	}
 
 	return cloneSession(session), nil
+}
+
+func (m *Manager) removeSessionLocked(sessionID string, record *record) {
+	delete(m.byResume, record.resumeToken)
+	delete(m.byHost, hostFromPublicURL(record.session.PublicURL))
+	delete(m.bySubdomain, record.session.Subdomain)
+	m.deactivateRoutingLocked(sessionID, record.session.PublicURL, record.session.Subdomain)
+	delete(m.sessions, sessionID)
 }
 
 func cloneSession(in api.Session) api.Session {
@@ -405,6 +484,86 @@ func hostFromPublicURL(publicURL string) string {
 	}
 	host := strings.TrimSpace(strings.ToLower(parsed.Hostname()))
 	return host
+}
+
+func (m *Manager) allocateSubdomain(requested string) (string, error) {
+	requested = strings.TrimSpace(strings.ToLower(requested))
+	if requested != "" {
+		if err := m.ensureSubdomainAvailable(requested); err != nil {
+			return "", err
+		}
+		return requested, nil
+	}
+
+	for attempt := 0; attempt < 32; attempt++ {
+		subdomain, err := tunnel.GenerateSubdomain()
+		if err != nil {
+			return "", fmt.Errorf("generate subdomain: %w", err)
+		}
+		if err := m.ensureSubdomainAvailable(subdomain); err == nil {
+			return subdomain, nil
+		}
+	}
+	return "", errors.New("exhausted subdomain generation attempts")
+}
+
+func (m *Manager) ensureSubdomainAvailable(subdomain string) error {
+	subdomain = strings.TrimSpace(strings.ToLower(subdomain))
+	if subdomain == "" {
+		return errors.New("subdomain cannot be empty")
+	}
+
+	m.mu.RLock()
+	_, exists := m.bySubdomain[subdomain]
+	m.mu.RUnlock()
+	if exists {
+		return fmt.Errorf("subdomain %q is already assigned", subdomain)
+	}
+
+	if m.store != nil {
+		record, ok, err := m.store.FindBySubdomain(subdomain)
+		if err != nil {
+			return err
+		}
+		if ok && record.ID != "" {
+			return fmt.Errorf("subdomain %q is already assigned", subdomain)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) activateRoutingLocked(sessionID, publicURL, subdomain string) {
+	host := hostFromPublicURL(publicURL)
+	if host != "" {
+		m.activeByHost[host] = sessionID
+	}
+	if subdomain != "" {
+		m.activeBySubdomain[subdomain] = sessionID
+	}
+}
+
+func (m *Manager) deactivateRoutingLocked(sessionID, publicURL, subdomain string) {
+	host := hostFromPublicURL(publicURL)
+	if host != "" {
+		if current, ok := m.activeByHost[host]; ok && current == sessionID {
+			delete(m.activeByHost, host)
+		}
+	}
+	if subdomain != "" {
+		if current, ok := m.activeBySubdomain[subdomain]; ok && current == sessionID {
+			delete(m.activeBySubdomain, subdomain)
+		}
+	}
+}
+
+func (m *Manager) persistTunnelLocked(record *record) error {
+	if m.store == nil || record == nil {
+		return nil
+	}
+	if err := m.store.Upsert(record.tunnel); err != nil {
+		return fmt.Errorf("persist tunnel %s: %w", record.tunnel.ID, err)
+	}
+	return nil
 }
 
 func newSessionID() (string, error) {

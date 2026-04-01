@@ -18,6 +18,7 @@ import (
 	"github.com/sardorazimov/binboi-go/internal/control"
 	"github.com/sardorazimov/binboi-go/internal/observability"
 	"github.com/sardorazimov/binboi-go/internal/session"
+	"github.com/sardorazimov/binboi-go/internal/tunnel"
 )
 
 var (
@@ -78,13 +79,17 @@ func runDaemon(args []string) error {
 	if err := tokenStore.Ensure(); err != nil {
 		return fmt.Errorf("initialize token store: %w", err)
 	}
+	tunnelStore := tunnel.NewStore(cfg.Tunnel.DatabasePath)
+	if err := tunnelStore.Ensure(); err != nil {
+		return fmt.Errorf("initialize tunnel store: %w", err)
+	}
 
 	tokenValidator := auth.NewValidator(tokenStore, auth.ValidatorConfig{
 		CacheTTL:               time.Duration(cfg.Auth.CacheTTLSeconds) * time.Second,
 		LastUsedUpdateInterval: time.Duration(cfg.Auth.LastUsedUpdateIntervalSeconds) * time.Second,
 	}, logger)
 
-	manager := session.NewManager(cfg.Tunnel.PublicHost, cfg.Proxy.ForwardedHeader)
+	manager := session.NewManagerWithStore(cfg.Tunnel.PublicHost, cfg.Proxy.ForwardedHeader, tunnelStore)
 	server := control.NewServer(control.ServerConfig{
 		HTTPAddress:       cfg.Control.ListenAddress,
 		ProtocolAddress:   cfg.Control.ProtocolAddress,
@@ -109,6 +114,7 @@ func runDaemon(args []string) error {
 		"stream_timeout", cfg.Control.FlowControl.Normalize().StreamTimeout(),
 		"stream_idle_timeout", cfg.Control.FlowControl.Normalize().StreamIdleTimeout(),
 		"public_host", cfg.Tunnel.PublicHost,
+		"tunnel_database_path", cfg.Tunnel.DatabasePath,
 		"auth_database_path", cfg.Auth.DatabasePath,
 		"auth_cache_ttl", time.Duration(cfg.Auth.CacheTTLSeconds)*time.Second,
 		"auth_touch_interval", time.Duration(cfg.Auth.LastUsedUpdateIntervalSeconds)*time.Second,

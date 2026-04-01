@@ -25,6 +25,8 @@ type Session struct {
 	ID            string     `json:"id"`
 	Name          string     `json:"name"`
 	UserID        string     `json:"user_id,omitempty"`
+	TokenID       string     `json:"token_id,omitempty"`
+	Subdomain     string     `json:"subdomain,omitempty"`
 	Protocol      string     `json:"protocol"`
 	Target        string     `json:"target"`
 	LocalPort     int        `json:"local_port,omitempty"`

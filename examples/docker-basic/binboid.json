@@ -16,7 +16,8 @@
   },
   "tunnel": {
     "public_host": "docker.binboi.local",
-    "default_protocol": "http"
+    "default_protocol": "http",
+    "database_path": "./data/binboi-tunnels.json"
   },
   "proxy": {
     "forwarded_header": "X-Binboi-Session"

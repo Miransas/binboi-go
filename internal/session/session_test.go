@@ -25,6 +25,9 @@ func TestManagerCreateAndList(t *testing.T) {
 	if created.PublicURL == "" {
 		t.Fatal("expected public URL to be populated")
 	}
+	if created.Subdomain == "" {
+		t.Fatal("expected subdomain to be populated")
+	}
 
 	sessions := manager.List(context.Background())
 	if len(sessions) != 1 {
@@ -56,8 +59,14 @@ func TestManagerRegisterAndHeartbeat(t *testing.T) {
 	if registered.LocalPort != 3000 {
 		t.Fatalf("local port mismatch: got %d want 3000", registered.LocalPort)
 	}
+	if registered.Subdomain == "" {
+		t.Fatal("expected subdomain")
+	}
 	if registered.LastHeartbeat == nil {
 		t.Fatal("expected last heartbeat to be initialized")
+	}
+	if lookedUp, ok := manager.LookupByHost(hostFromPublicURL(registered.PublicURL)); !ok || lookedUp.ID != registered.ID {
+		t.Fatal("expected route lookup by public host to return registered session")
 	}
 
 	now := time.Now().UTC()
@@ -77,6 +86,9 @@ func TestManagerRegisterAndHeartbeat(t *testing.T) {
 	sessions = manager.List(context.Background())
 	if sessions[0].Connection != "disconnected" {
 		t.Fatalf("connection state mismatch: got %q want disconnected", sessions[0].Connection)
+	}
+	if lookedUp, ok := manager.LookupByHost(hostFromPublicURL(registered.PublicURL)); !ok || lookedUp.Connection != "disconnected" {
+		t.Fatal("expected disconnected tunnel to remain known for inactive routing decisions")
 	}
 }
 
@@ -123,5 +135,8 @@ func TestManagerResumeTunnel(t *testing.T) {
 	}
 	if resumed.Session.ID != initial.Session.ID {
 		t.Fatalf("session ID mismatch: got %q want %q", resumed.Session.ID, initial.Session.ID)
+	}
+	if resumed.Session.Subdomain != initial.Session.Subdomain {
+		t.Fatalf("subdomain mismatch after resume: got %q want %q", resumed.Session.Subdomain, initial.Session.Subdomain)
 	}
 }

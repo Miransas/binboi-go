@@ -70,6 +70,7 @@ type FlowControl struct {
 // RegisteredPayload confirms that the daemon accepted a tunnel session.
 type RegisteredPayload struct {
 	TunnelID                 string      `json:"tunnel_id"`
+	Subdomain                string      `json:"subdomain,omitempty"`
 	Protocol                 string      `json:"protocol"`
 	LocalPort                int         `json:"local_port"`
 	Target                   string      `json:"target"`

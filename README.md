@@ -55,7 +55,7 @@ go run ./cmd/binboi health
 go run ./cmd/binboi http 3000
 ```
 
-That command connects to the daemon, automatically includes the locally saved auth token in the `register` handshake, receives tunnel metadata, keeps the control connection alive with heartbeat `ping`/`pong` messages, can proxy basic HTTP requests and upgraded WebSocket connections back to your local service, automatically retries with session resume when the control connection drops, and applies bounded per-stream flow control for safer multiplexing.
+That command connects to the daemon, automatically includes the locally saved auth token in the `register` handshake, receives tunnel metadata including a random public subdomain, keeps the control connection alive with heartbeat `ping`/`pong` messages, can proxy basic HTTP requests and upgraded WebSocket connections back to your local service, automatically retries with session resume when the control connection drops, and applies bounded per-stream flow control for safer multiplexing.
 
 ### 6. Generate a config file
 
@@ -83,10 +83,11 @@ The private Binboi product repository can depend on this engine, embed it, wrap 
 
 ## Development Notes
 
-- The current scaffold implements a working HTTP API, stream control protocol, hashed token-based client auth with in-memory validation cache, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, upgraded WebSocket tunneling, framed body streaming, and bounded flow control with fair per-stream scheduling.
+- The current scaffold implements a working HTTP API, stream control protocol, hashed token-based client auth with in-memory validation cache, random public subdomain assignment, host-based tunnel routing, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, upgraded WebSocket tunneling, framed body streaming, and bounded flow control with fair per-stream scheduling.
 - The forwarding layer is still intentionally modest: HTTP and WebSocket traffic work over framed streams with backpressure and idle timeouts, but richer flow windows, binary framing, and more advanced protocol adapters are still future work.
 - Daemon flow limits live under `control.flow_control` in the JSON config and control active streams, per-stream buffering, stream timeout, and idle timeout behavior.
 - Client auth settings live under `auth` in the daemon config and control the token database path, validation cache TTL, and `last_used_at` persistence cadence.
+- Tunnel routing settings live under `tunnel` in the daemon config and control the public host suffix plus the local tunnel registry path used for subdomain uniqueness and tunnel status tracking.
 - The codebase favors standard library dependencies to keep the engine portable and easy to audit.
 - Folder-level README files are included to make each major area understandable on first read.
 

@@ -117,6 +117,9 @@ func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 	if initial.Resumed {
 		t.Fatal("expected first registration to be fresh")
 	}
+	if initial.Subdomain == "" {
+		t.Fatal("expected registered subdomain")
+	}
 
 	waitForConnectionState(t, manager, initial.TunnelID, "connected")
 
@@ -135,6 +138,9 @@ func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 	}
 	if resumed.PublicURL != initial.PublicURL {
 		t.Fatalf("public URL mismatch after resume: got %q want %q", resumed.PublicURL, initial.PublicURL)
+	}
+	if resumed.Subdomain != initial.Subdomain {
+		t.Fatalf("subdomain mismatch after resume: got %q want %q", resumed.Subdomain, initial.Subdomain)
 	}
 
 	waitForConnectionState(t, manager, initial.TunnelID, "connected")

@@ -38,6 +38,7 @@ type ControlConfig struct {
 type TunnelConfig struct {
 	PublicHost      string `json:"public_host"`
 	DefaultProtocol string `json:"default_protocol"`
+	DatabasePath    string `json:"database_path"`
 }
 
 // ProxyConfig carries edge-routing defaults.
@@ -74,6 +75,7 @@ func Default() Config {
 		Tunnel: TunnelConfig{
 			PublicHost:      "local.binboi.test",
 			DefaultProtocol: "http",
+			DatabasePath:    "./data/binboi-tunnels.json",
 		},
 		Proxy: ProxyConfig{
 			ForwardedHeader: "X-Binboi-Session",
@@ -166,6 +168,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Tunnel.DefaultProtocol == "" {
 		return errors.New("tunnel.default_protocol is required")
+	}
+	if cfg.Tunnel.DatabasePath == "" {
+		return errors.New("tunnel.database_path is required")
 	}
 	if cfg.Auth.DatabasePath == "" {
 		return errors.New("auth.database_path is required")

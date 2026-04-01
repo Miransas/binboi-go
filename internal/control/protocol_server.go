@@ -102,6 +102,13 @@ func (s *protocolServer) ForwardRequest(ctx context.Context, host string, reques
 	if !ok {
 		return nil, errTunnelNotFound
 	}
+	s.logger.Info("routing tunneled request",
+		"host", host,
+		"tunnel_id", sessionState.ID,
+		"subdomain", sessionState.Subdomain,
+		"status", sessionState.Status,
+		"connection", sessionState.Connection,
+	)
 	if sessionState.Connection != "connected" {
 		return nil, errTunnelUnavailable
 	}
@@ -242,6 +249,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 	resumeToken, _ := s.manager.ResumeToken(registeredSession.ID)
 	registeredMessage, err := api.NewMessage(api.MessageTypeRegistered, api.RegisteredPayload{
 		TunnelID:                 registeredSession.ID,
+		Subdomain:                registeredSession.Subdomain,
 		Protocol:                 registeredSession.Protocol,
 		LocalPort:                registeredSession.LocalPort,
 		Target:                   registeredSession.Target,
@@ -266,6 +274,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		"tunnel_id", sessionID,
 		"user_id", principal.UserID,
 		"token_prefix", principal.Prefix,
+		"subdomain", registeredSession.Subdomain,
 		"protocol", registeredSession.Protocol,
 		"local_port", registeredSession.LocalPort,
 		"public_url", registeredSession.PublicURL,
