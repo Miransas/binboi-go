@@ -41,7 +41,7 @@ go run ./cmd/binboi health
 go run ./cmd/binboi http 3000
 ```
 
-That command connects to the daemon, sends a `register` message, receives tunnel metadata, and keeps the control connection alive with heartbeat `ping`/`pong` messages.
+That command connects to the daemon, sends a `register` message, receives tunnel metadata, keeps the control connection alive with heartbeat `ping`/`pong` messages, and can proxy basic HTTP requests back to your local service.
 
 ### 4. Generate a config file
 
@@ -69,8 +69,8 @@ The private Binboi product repository can depend on this engine, embed it, wrap 
 
 ## Development Notes
 
-- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, and in-memory session tracking.
-- Tunnel forwarding is still intentionally deferred. The current protocol layer focuses on registration, tunnel metadata, and heartbeats.
+- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, in-memory session tracking, and basic HTTP request forwarding.
+- The forwarding layer is intentionally minimal for now: no streaming bodies, no multiplex optimization, and no reconnect flow yet.
 - The codebase favors standard library dependencies to keep the engine portable and easy to audit.
 - Folder-level README files are included to make each major area understandable on first read.
 

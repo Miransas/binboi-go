@@ -35,7 +35,10 @@ func (e *Engine) Prepare(sessionID, name, protocol string, route proxy.Route) De
 	}
 
 	host := fmt.Sprintf("%s.%s", label, e.publicHost)
-	publicURL := "https://" + host
+	publicURL := "http://" + host
+	if protocol == "https" {
+		publicURL = "https://" + host
+	}
 	if protocol == "tcp" {
 		publicURL = "tcp://" + host
 	}

@@ -35,7 +35,8 @@ The current scaffold is intentionally modest: it implements a working control pl
 3. The control plane exposes `GET /healthz`, `GET/POST /v1/sessions`, and a JSON-over-TCP stream listener.
 4. `binboi http 3000` connects to the stream listener, sends a `register` message, and receives a `registered` response with tunnel metadata.
 5. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
-6. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
+6. Incoming HTTP requests are converted into `request` protocol messages, forwarded to the connected client, proxied to the local service, and returned as `response` messages.
+7. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
 
 ## Why The Implementation Is Intentionally Small
 
@@ -57,7 +58,7 @@ The tunnel and proxy layers therefore expose realistic integration points withou
 - proxy transport adapters
 - metrics and tracing
 - richer client ergonomics
-- request/response forwarding on top of the established register and heartbeat channel
+- multiplexed forwarding and request streaming on top of the established request/response channel
 
 ## Design Principles
 

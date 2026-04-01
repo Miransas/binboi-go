@@ -43,6 +43,7 @@ func NewServer(cfg ServerConfig, logger *slog.Logger, manager *session.Manager) 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealth)
 	mux.HandleFunc("/v1/sessions", server.handleSessions)
+	mux.HandleFunc("/", server.handleTunnelRequest)
 
 	server.httpServer = &http.Server{
 		Addr:              cfg.HTTPAddress,
@@ -165,6 +166,57 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		writeError(w, http.StatusNotImplemented, "CONNECT is not supported yet")
+		return
+	}
+
+	request, err := requestFromHTTP(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	host := normalizeHost(r.Host)
+	s.logger.Info("incoming tunneled request",
+		"host", host,
+		"method", request.Method,
+		"path", request.Path,
+	)
+
+	response, err := s.protocolServer.ForwardRequest(r.Context(), host, request)
+	if err != nil {
+		switch {
+		case errors.Is(err, errTunnelNotFound):
+			writeError(w, http.StatusNotFound, "no active tunnel for host")
+		case errors.Is(err, errTunnelUnsupported):
+			writeError(w, http.StatusNotImplemented, "tunnel protocol does not support HTTP forwarding yet")
+		case errors.Is(err, context.DeadlineExceeded):
+			writeError(w, http.StatusGatewayTimeout, "tunnel request timed out")
+		case errors.Is(err, context.Canceled):
+			writeError(w, http.StatusGatewayTimeout, "client closed request")
+		default:
+			s.logger.Warn("failed to forward request",
+				"host", host,
+				"method", request.Method,
+				"path", request.Path,
+				"error", err,
+			)
+			writeError(w, http.StatusBadGateway, "failed to forward tunneled request")
+		}
+		return
+	}
+
+	s.logger.Info("sending tunneled response",
+		"host", host,
+		"method", request.Method,
+		"path", request.Path,
+		"status", response.Status,
+	)
+	writeForwardedHTTPResponse(w, response)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

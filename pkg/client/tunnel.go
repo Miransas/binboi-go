@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ type TunnelSession struct {
 	logger            *slog.Logger
 	registered        api.RegisteredPayload
 	heartbeatInterval time.Duration
+	httpClient        *http.Client
 	closeOnce         sync.Once
 }
 
@@ -124,6 +126,9 @@ func (c *TunnelClient) Connect(ctx context.Context, payload api.RegisterPayload)
 			logger:            c.logger,
 			registered:        registered,
 			heartbeatInterval: heartbeatInterval,
+			httpClient: &http.Client{
+				Timeout: 30 * time.Second,
+			},
 		}, nil
 	case api.MessageTypeError:
 		var protocolErr api.ProtocolErrorPayload
@@ -217,6 +222,16 @@ func (s *TunnelSession) Run(ctx context.Context) error {
 				"reason", closePayload.Reason,
 			)
 			return nil
+		case api.MessageTypeRequest:
+			var request api.RequestPayload
+			if err := message.Decode(&request); err != nil {
+				return err
+			}
+			if message.ID == "" {
+				return errors.New("request message missing id")
+			}
+
+			go s.handleRequest(ctx, message.ID, request)
 		default:
 			s.logger.Warn("ignoring unexpected control message",
 				"tunnel_id", s.registered.TunnelID,
@@ -257,17 +272,6 @@ func (s *TunnelSession) heartbeatLoop(ctx context.Context) error {
 			sequence++
 		}
 	}
-}
-
-func (s *TunnelSession) send(messageType api.MessageType, payload any) error {
-	message, err := api.NewMessage(messageType, payload)
-	if err != nil {
-		return err
-	}
-	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return err
-	}
-	return s.codec.Send(message)
 }
 
 func (s *TunnelSession) closeConn() {

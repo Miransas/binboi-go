@@ -23,9 +23,9 @@ const (
 
 // Message is the generic JSON envelope exchanged over the stream control plane.
 type Message struct {
-	Type      MessageType      `json:"type"`
-	RequestID string           `json:"request_id,omitempty"`
-	Payload   *json.RawMessage `json:"payload,omitempty"`
+	Type    MessageType      `json:"type"`
+	ID      string           `json:"id,omitempty"`
+	Payload *json.RawMessage `json:"payload,omitempty"`
 }
 
 // RegisterPayload is sent by the client immediately after connecting.
@@ -65,6 +65,22 @@ type PingPayload struct {
 type PongPayload struct {
 	Sequence   int64     `json:"sequence"`
 	ReceivedAt time.Time `json:"received_at"`
+}
+
+// RequestPayload asks the client to proxy an HTTP request to the local service.
+type RequestPayload struct {
+	Method  string              `json:"method"`
+	Path    string              `json:"path"`
+	Host    string              `json:"host,omitempty"`
+	Headers map[string][]string `json:"headers,omitempty"`
+	Body    string              `json:"body,omitempty"`
+}
+
+// ResponsePayload returns the local service's HTTP response.
+type ResponsePayload struct {
+	Status  int                 `json:"status"`
+	Headers map[string][]string `json:"headers,omitempty"`
+	Body    string              `json:"body,omitempty"`
 }
 
 // ProtocolErrorPayload reports a protocol-level failure.
