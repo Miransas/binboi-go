@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sardorazimov/binboi-go/internal/session"
+	"github.com/sardorazimov/binboi-go/internal/usage"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
 
@@ -71,9 +72,11 @@ type pendingRequest struct {
 	bytesSent     int64
 	bytesReceived int64
 	idleTimer     *time.Timer
+	usage         UsageTracker
+	reservation   usage.RequestReservation
 }
 
-func newPendingRequest(id string, peer *protocolPeer, parent context.Context, start api.RequestStartPayload) *pendingRequest {
+func newPendingRequest(id string, peer *protocolPeer, parent context.Context, start api.RequestStartPayload, reservation usage.RequestReservation) *pendingRequest {
 	streamCtx, cancel := context.WithTimeout(parent, peer.flowControl.StreamTimeout())
 	reader, writer := io.Pipe()
 	now := time.Now().UTC()
@@ -96,6 +99,8 @@ func newPendingRequest(id string, peer *protocolPeer, parent context.Context, st
 		state:          streamStateWaiting,
 		createdAt:      now,
 		lastActivity:   now,
+		usage:          peer.usage,
+		reservation:    reservation,
 	}
 
 	if idleTimeout := peer.flowControl.StreamIdleTimeout(); idleTimeout > 0 {
@@ -206,6 +211,9 @@ func (r *pendingRequest) finish(err error) {
 	r.releaseSlot()
 	close(r.finishedCh)
 	r.cancelFn()
+	if r.usage != nil {
+		r.usage.CompleteRequest(r.reservation, bytesSent, bytesReceived)
+	}
 
 	r.logger.Info("stream completed",
 		"tunnel_id", r.sessionID,
@@ -318,6 +326,7 @@ type protocolPeer struct {
 	codec   *api.MessageCodec
 	logger  *slog.Logger
 	manager *session.Manager
+	usage   UsageTracker
 
 	flowControl api.FlowControl
 	dispatcher  *api.MessageDispatcher
@@ -331,13 +340,14 @@ type protocolPeer struct {
 	pending   map[string]*pendingRequest
 }
 
-func newProtocolPeer(session api.Session, conn net.Conn, codec *api.MessageCodec, logger *slog.Logger, manager *session.Manager, flowControl api.FlowControl) *protocolPeer {
+func newProtocolPeer(session api.Session, conn net.Conn, codec *api.MessageCodec, logger *slog.Logger, manager *session.Manager, flowControl api.FlowControl, usageTracker UsageTracker) *protocolPeer {
 	peer := &protocolPeer{
 		session:     session,
 		conn:        conn,
 		codec:       codec,
 		logger:      logger,
 		manager:     manager,
+		usage:       usageTracker,
 		flowControl: flowControl.Normalize(),
 		streamSlots: make(chan struct{}, flowControl.Normalize().MaxConcurrentStreams),
 		closedCh:    make(chan struct{}),
@@ -358,14 +368,14 @@ func newProtocolPeer(session api.Session, conn net.Conn, codec *api.MessageCodec
 	return peer
 }
 
-func (p *protocolPeer) forwardHTTP(ctx context.Context, request *http.Request) (*pendingRequest, error) {
+func (p *protocolPeer) forwardHTTP(ctx context.Context, request *http.Request, reservation usage.RequestReservation) (*pendingRequest, error) {
 	if err := p.acquireStreamSlot(ctx); err != nil {
 		return nil, err
 	}
 
 	start := requestStartFromHTTP(request)
 	requestID := p.newRequestID()
-	pending := newPendingRequest(requestID, p, ctx, start)
+	pending := newPendingRequest(requestID, p, ctx, start, reservation)
 
 	p.pendingMu.Lock()
 	p.pending[requestID] = pending

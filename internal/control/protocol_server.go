@@ -13,6 +13,7 @@ import (
 
 	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/session"
+	"github.com/sardorazimov/binboi-go/internal/usage"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
 
@@ -25,13 +26,14 @@ type protocolServer struct {
 	logger            *slog.Logger
 	manager           *session.Manager
 	validator         TokenValidator
+	usage             UsageTracker
 
 	mu       sync.RWMutex
 	listener net.Listener
 	peers    map[string]*protocolPeer
 }
 
-func newProtocolServer(address string, heartbeatInterval time.Duration, flowControl api.FlowControl, logger *slog.Logger, manager *session.Manager, validator TokenValidator) *protocolServer {
+func newProtocolServer(address string, heartbeatInterval time.Duration, flowControl api.FlowControl, logger *slog.Logger, manager *session.Manager, validator TokenValidator, usageTracker UsageTracker) *protocolServer {
 	return &protocolServer{
 		address:           address,
 		heartbeatInterval: heartbeatInterval,
@@ -39,6 +41,7 @@ func newProtocolServer(address string, heartbeatInterval time.Duration, flowCont
 		logger:            logger,
 		manager:           manager,
 		validator:         validator,
+		usage:             usageTracker,
 		peers:             make(map[string]*protocolPeer),
 	}
 }
@@ -121,7 +124,24 @@ func (s *protocolServer) ForwardRequest(ctx context.Context, host string, reques
 		return nil, errTunnelUnavailable
 	}
 
-	return peer.forwardHTTP(ctx, request)
+	reservation := usage.RequestReservation{}
+	if s.usage != nil {
+		estimatedBytesIn := request.ContentLength
+		if estimatedBytesIn < 0 {
+			estimatedBytesIn = 0
+		}
+		var err error
+		reservation, err = s.usage.ReserveRequest(sessionState.UserID, estimatedBytesIn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	pending, err := peer.forwardHTTP(ctx, request, reservation)
+	if err != nil && s.usage != nil {
+		s.usage.ReleaseRequest(reservation)
+	}
+	return pending, err
 }
 
 func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
@@ -135,6 +155,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		sessionID string
 		localPort int
 		peer      *protocolPeer
+		userID    string
 	)
 
 	defer func() {
@@ -144,6 +165,9 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 			}
 			s.removePeer(sessionID, peer)
 			s.manager.DetachConnection(sessionID, time.Now().UTC())
+			if s.usage != nil && userID != "" {
+				s.usage.TrackTunnelClosed(userID, sessionID)
+			}
 			if peer != nil {
 				peer.failPending(errTunnelUnavailable)
 			}
@@ -184,6 +208,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	var principal auth.Principal
+	var tunnelReservation usage.TunnelReservation
 	if s.validator != nil {
 		principal, err = s.validator.Validate(ctx, register.AuthToken)
 		if err != nil {
@@ -207,6 +232,24 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 	}
+	if s.usage != nil && register.ResumeTunnelID == "" {
+		tunnelReservation, err = s.usage.ReserveTunnel(principal.UserID)
+		if err != nil {
+			s.sendProtocolError(conn, codec, "", "usage_limit_exceeded", err.Error())
+			s.logger.Warn("tunnel rejected by usage limits",
+				"remote_addr", remoteAddr,
+				"user_id", principal.UserID,
+				"local_port", register.LocalPort,
+				"error", err,
+			)
+			return
+		}
+	}
+	defer func() {
+		if s.usage != nil && tunnelReservation != (usage.TunnelReservation{}) {
+			s.usage.ReleaseTunnelReservation(tunnelReservation)
+		}
+	}()
 
 	registerResult, err := s.manager.RegisterTunnel(ctx, session.RegisterRequest{
 		Protocol:       register.Protocol,
@@ -237,9 +280,18 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 
 	registeredSession := registerResult.Session
 	sessionID = registeredSession.ID
+	userID = registeredSession.UserID
 	localPort = register.LocalPort
-	peer = newProtocolPeer(registeredSession, conn, codec, s.logger, s.manager, s.flowControl)
+	peer = newProtocolPeer(registeredSession, conn, codec, s.logger, s.manager, s.flowControl, s.usage)
 	s.addPeer(peer)
+	if s.usage != nil {
+		if registerResult.Resumed {
+			s.usage.RestoreTunnel(registeredSession.UserID, registeredSession.ID)
+		} else {
+			s.usage.ConfirmTunnel(tunnelReservation, registeredSession.ID)
+			tunnelReservation = usage.TunnelReservation{}
+		}
+	}
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		s.logger.Warn("failed to clear connection deadlines", "tunnel_id", sessionID, "error", err)

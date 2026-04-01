@@ -22,6 +22,7 @@ import (
 
 	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/session"
+	"github.com/sardorazimov/binboi-go/internal/usage"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 	"github.com/sardorazimov/binboi-go/pkg/client"
 )
@@ -82,7 +83,7 @@ func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
-	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager, nil)
+	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +178,7 @@ func TestProtocolRegisterRequiresValidToken(t *testing.T) {
 		LastUsedUpdateInterval: time.Millisecond,
 	}, logger)
 
-	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager, validator)
+	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager, validator, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -239,6 +240,124 @@ func TestProtocolRegisterRequiresValidToken(t *testing.T) {
 	}
 	if protocolErr.Code != "invalid_token" {
 		t.Fatalf("protocol error code mismatch: got %q want %q", protocolErr.Code, "invalid_token")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
+func TestUsageLimitRejectsSecondRequest(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+	authStore := auth.NewStore(t.TempDir() + "/tokens.json")
+	if err := authStore.Ensure(); err != nil {
+		t.Fatalf("ensure auth store: %v", err)
+	}
+	createdToken, err := authStore.CreateToken(context.Background(), "user-usage")
+	if err != nil {
+		t.Fatalf("create auth token: %v", err)
+	}
+	authValidator := auth.NewValidator(authStore, auth.ValidatorConfig{
+		CacheTTL:               time.Second,
+		LastUsedUpdateInterval: time.Millisecond,
+	}, logger)
+	usageStore := usage.NewStore(t.TempDir() + "/usage.json")
+	if err := usageStore.Ensure(); err != nil {
+		t.Fatalf("ensure usage store: %v", err)
+	}
+	usageTracker := usage.NewTracker(usageStore, usage.Config{
+		DatabasePath:         usageStore.Path(),
+		FlushIntervalSeconds: 60,
+		Period:               usage.PeriodMonthly,
+		Limits: usage.Limits{
+			MaxRequests:      1,
+			MaxBytesIn:       1 << 20,
+			MaxBytesOut:      1 << 20,
+			MaxActiveTunnels: 2,
+		},
+	}, logger)
+
+	server := NewServer(ServerConfig{
+		HTTPAddress:       ":0",
+		ProtocolAddress:   "127.0.0.1:0",
+		HeartbeatInterval: time.Second,
+		FlowControl:       api.FlowControl{}.Normalize(),
+		AuthValidator:     authValidator,
+		UsageTracker:      usageTracker,
+		Name:              "binboid",
+		Version:           "test",
+	}, logger, manager)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go usageTracker.Run(ctx)
+
+	upstreamURL, shutdownUpstream := startUpstreamHTTPServer(t, 0)
+	defer shutdownUpstream()
+
+	localURL, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	localPort, err := portFromHost(localURL.Host)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.protocolServer.Run(ctx)
+	}()
+
+	address := waitForAddress(t, server.protocolServer)
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: localPort,
+		AuthToken: createdToken.RawToken,
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err != nil {
+		t.Fatalf("connect tunnel client: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	publicHost := hostNameFromPublicURL(tunnelSession.Registered().PublicURL)
+	first := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodGet, "http://"+publicHost+"/one", nil)
+	req1.Host = publicHost
+	server.Handler().ServeHTTP(first, req1)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first response status mismatch: got %d want %d", first.Code, http.StatusCreated)
+	}
+
+	second := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "http://"+publicHost+"/two", nil)
+	req2.Host = publicHost
+	server.Handler().ServeHTTP(second, req2)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second response status mismatch: got %d want %d", second.Code, http.StatusTooManyRequests)
+	}
+
+	stop()
+	if err := <-runDone; err != nil {
+		t.Fatalf("run tunnel session: %v", err)
 	}
 
 	cancel()

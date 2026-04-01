@@ -15,12 +15,25 @@ import (
 
 	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/session"
+	"github.com/sardorazimov/binboi-go/internal/usage"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
 
 // TokenValidator authenticates raw tokens during the stream register handshake.
 type TokenValidator interface {
 	Validate(ctx context.Context, rawToken string) (auth.Principal, error)
+}
+
+// UsageTracker enforces plan limits and aggregates user usage in memory.
+type UsageTracker interface {
+	ReserveTunnel(userID string) (usage.TunnelReservation, error)
+	ReleaseTunnelReservation(reservation usage.TunnelReservation)
+	ConfirmTunnel(reservation usage.TunnelReservation, tunnelID string)
+	RestoreTunnel(userID, tunnelID string)
+	TrackTunnelClosed(userID, tunnelID string)
+	ReserveRequest(userID string, estimatedBytesIn int64) (usage.RequestReservation, error)
+	ReleaseRequest(reservation usage.RequestReservation)
+	CompleteRequest(reservation usage.RequestReservation, bytesIn, bytesOut int64)
 }
 
 // ServerConfig contains the daemon's HTTP and stream control-plane settings.
@@ -30,6 +43,7 @@ type ServerConfig struct {
 	HeartbeatInterval time.Duration
 	FlowControl       api.FlowControl
 	AuthValidator     TokenValidator
+	UsageTracker      UsageTracker
 	Name              string
 	Version           string
 }
@@ -61,7 +75,7 @@ func NewServer(cfg ServerConfig, logger *slog.Logger, manager *session.Manager) 
 		Handler:           loggingMiddleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, cfg.FlowControl.Normalize(), logger, manager, cfg.AuthValidator)
+	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, cfg.FlowControl.Normalize(), logger, manager, cfg.AuthValidator, cfg.UsageTracker)
 
 	return server
 }
@@ -212,9 +226,21 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeTunnelForwardError(w http.ResponseWriter, r *http.Request, host string, err error) {
+	var limitErr *usage.LimitError
 	switch {
 	case errors.Is(err, errTunnelNotFound):
 		writeError(w, http.StatusNotFound, "no active tunnel for host")
+	case errors.As(err, &limitErr):
+		s.logger.Warn("usage limit blocked tunneled request",
+			"host", host,
+			"method", r.Method,
+			"path", r.URL.RequestURI(),
+			"user_id", limitErr.UserID,
+			"resource", limitErr.Resource,
+			"limit", limitErr.Limit,
+			"current", limitErr.Current,
+		)
+		writeError(w, http.StatusTooManyRequests, "usage limit exceeded")
 	case errors.Is(err, errTunnelUnavailable):
 		writeError(w, http.StatusServiceUnavailable, "tunnel is currently disconnected")
 	case errors.Is(err, errTunnelUnsupported):

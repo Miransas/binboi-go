@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/sardorazimov/binboi-go/internal/usage"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
 
@@ -17,6 +18,7 @@ type Config struct {
 	Tunnel        TunnelConfig        `json:"tunnel"`
 	Proxy         ProxyConfig         `json:"proxy"`
 	Auth          AuthConfig          `json:"auth"`
+	Usage         usage.Config        `json:"usage"`
 	Observability ObservabilityConfig `json:"observability"`
 }
 
@@ -84,6 +86,17 @@ func Default() Config {
 			DatabasePath:                  "./data/binboi-tokens.json",
 			CacheTTLSeconds:               30,
 			LastUsedUpdateIntervalSeconds: 60,
+		},
+		Usage: usage.Config{
+			DatabasePath:         "./data/binboi-usage.json",
+			FlushIntervalSeconds: 10,
+			Period:               usage.PeriodMonthly,
+			Limits: usage.Limits{
+				MaxRequests:      1_000_000,
+				MaxBytesIn:       1 << 30,
+				MaxBytesOut:      1 << 30,
+				MaxActiveTunnels: 10,
+			},
 		},
 		Observability: ObservabilityConfig{
 			Level:  "info",
@@ -180,6 +193,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Auth.LastUsedUpdateIntervalSeconds <= 0 {
 		return errors.New("auth.last_used_update_interval_seconds must be greater than zero")
+	}
+	if err := cfg.Usage.Validate(); err != nil {
+		return fmt.Errorf("usage: %w", err)
 	}
 	if cfg.Observability.Level == "" {
 		return errors.New("observability.level is required")

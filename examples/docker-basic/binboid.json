@@ -27,6 +27,17 @@
     "cache_ttl_seconds": 30,
     "last_used_update_interval_seconds": 60
   },
+  "usage": {
+    "database_path": "./data/binboi-usage.json",
+    "flush_interval_seconds": 10,
+    "period": "monthly",
+    "limits": {
+      "max_requests": 1000000,
+      "max_bytes_in": 1073741824,
+      "max_bytes_out": 1073741824,
+      "max_active_tunnels": 10
+    }
+  },
   "observability": {
     "level": "info",
     "format": "text"

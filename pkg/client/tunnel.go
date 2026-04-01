@@ -218,7 +218,7 @@ func (c *TunnelClient) Run(ctx context.Context, payload api.RegisterPayload, onC
 					resumeTunnelID = ""
 					resumeToken = ""
 					continue
-				case "invalid_register", "token_required", "invalid_token", "revoked_token":
+				case "invalid_register", "token_required", "invalid_token", "revoked_token", "usage_limit_exceeded":
 					return err
 				}
 			}

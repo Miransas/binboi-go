@@ -19,6 +19,7 @@ import (
 	"github.com/sardorazimov/binboi-go/internal/observability"
 	"github.com/sardorazimov/binboi-go/internal/session"
 	"github.com/sardorazimov/binboi-go/internal/tunnel"
+	"github.com/sardorazimov/binboi-go/internal/usage"
 )
 
 var (
@@ -83,11 +84,16 @@ func runDaemon(args []string) error {
 	if err := tunnelStore.Ensure(); err != nil {
 		return fmt.Errorf("initialize tunnel store: %w", err)
 	}
+	usageStore := usage.NewStore(cfg.Usage.DatabasePath)
+	if err := usageStore.Ensure(); err != nil {
+		return fmt.Errorf("initialize usage store: %w", err)
+	}
 
 	tokenValidator := auth.NewValidator(tokenStore, auth.ValidatorConfig{
 		CacheTTL:               time.Duration(cfg.Auth.CacheTTLSeconds) * time.Second,
 		LastUsedUpdateInterval: time.Duration(cfg.Auth.LastUsedUpdateIntervalSeconds) * time.Second,
 	}, logger)
+	usageTracker := usage.NewTracker(usageStore, cfg.Usage, logger)
 
 	manager := session.NewManagerWithStore(cfg.Tunnel.PublicHost, cfg.Proxy.ForwardedHeader, tunnelStore)
 	server := control.NewServer(control.ServerConfig{
@@ -96,12 +102,15 @@ func runDaemon(args []string) error {
 		HeartbeatInterval: time.Duration(cfg.Control.HeartbeatIntervalSeconds) * time.Second,
 		FlowControl:       cfg.Control.FlowControl,
 		AuthValidator:     tokenValidator,
+		UsageTracker:      usageTracker,
 		Name:              cfg.Service.Name,
 		Version:           version,
 	}, logger, manager)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	go usageTracker.Run(ctx)
 
 	logger.Info("starting binboid",
 		"version", version,
@@ -116,6 +125,13 @@ func runDaemon(args []string) error {
 		"public_host", cfg.Tunnel.PublicHost,
 		"tunnel_database_path", cfg.Tunnel.DatabasePath,
 		"auth_database_path", cfg.Auth.DatabasePath,
+		"usage_database_path", cfg.Usage.DatabasePath,
+		"usage_flush_interval", time.Duration(cfg.Usage.FlushIntervalSeconds)*time.Second,
+		"usage_period", cfg.Usage.Period,
+		"usage_max_requests", cfg.Usage.Limits.MaxRequests,
+		"usage_max_bytes_in", cfg.Usage.Limits.MaxBytesIn,
+		"usage_max_bytes_out", cfg.Usage.Limits.MaxBytesOut,
+		"usage_max_active_tunnels", cfg.Usage.Limits.MaxActiveTunnels,
 		"auth_cache_ttl", time.Duration(cfg.Auth.CacheTTLSeconds)*time.Second,
 		"auth_touch_interval", time.Duration(cfg.Auth.LastUsedUpdateIntervalSeconds)*time.Second,
 		"environment", cfg.Service.Environment,
