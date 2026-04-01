@@ -44,6 +44,7 @@ type pendingRequest struct {
 	sessionID string
 	peer      *protocolPeer
 	logger    *slog.Logger
+	start     api.RequestStartPayload
 
 	ctx        context.Context
 	cancelFn   context.CancelFunc
@@ -72,7 +73,7 @@ type pendingRequest struct {
 	idleTimer     *time.Timer
 }
 
-func newPendingRequest(id string, peer *protocolPeer, parent context.Context) *pendingRequest {
+func newPendingRequest(id string, peer *protocolPeer, parent context.Context, start api.RequestStartPayload) *pendingRequest {
 	streamCtx, cancel := context.WithTimeout(parent, peer.flowControl.StreamTimeout())
 	reader, writer := io.Pipe()
 	now := time.Now().UTC()
@@ -82,6 +83,7 @@ func newPendingRequest(id string, peer *protocolPeer, parent context.Context) *p
 		sessionID:      peer.session.ID,
 		peer:           peer,
 		logger:         peer.logger,
+		start:          start,
 		ctx:            streamCtx,
 		cancelFn:       cancel,
 		finishedCh:     make(chan struct{}),
@@ -363,7 +365,7 @@ func (p *protocolPeer) forwardHTTP(ctx context.Context, request *http.Request) (
 
 	start := requestStartFromHTTP(request)
 	requestID := p.newRequestID()
-	pending := newPendingRequest(requestID, p, ctx)
+	pending := newPendingRequest(requestID, p, ctx, start)
 
 	p.pendingMu.Lock()
 	p.pending[requestID] = pending
@@ -391,7 +393,15 @@ func (p *protocolPeer) forwardHTTP(ctx context.Context, request *http.Request) (
 		"in_flight", inFlight,
 	)
 
-	go p.streamRequestBody(pending, request.Body)
+	if api.IsUpgradeRequest(start) {
+		p.logger.Info("request entered upgrade mode",
+			"tunnel_id", p.session.ID,
+			"request_id", requestID,
+			"upgrade_type", start.UpgradeType,
+		)
+	} else {
+		go p.streamRequestBody(pending, request.Body)
+	}
 	go p.watchRequestContext(pending)
 
 	return pending, nil
@@ -399,7 +409,14 @@ func (p *protocolPeer) forwardHTTP(ctx context.Context, request *http.Request) (
 
 func (p *protocolPeer) streamRequestBody(pending *pendingRequest, body io.ReadCloser) {
 	defer body.Close()
+	p.streamRequestReader(pending, body)
+}
 
+func (p *protocolPeer) streamUpgradeData(pending *pendingRequest, reader io.Reader) {
+	p.streamRequestReader(pending, reader)
+}
+
+func (p *protocolPeer) streamRequestReader(pending *pendingRequest, reader io.Reader) {
 	buf := make([]byte, api.DefaultBodyChunkSize)
 	chunks := 0
 
@@ -408,7 +425,7 @@ func (p *protocolPeer) streamRequestBody(pending *pendingRequest, body io.ReadCl
 			return
 		}
 
-		n, err := body.Read(buf)
+		n, err := reader.Read(buf)
 		if n > 0 {
 			chunkPayload := api.BodyChunkPayload{Chunk: append([]byte(nil), buf[:n]...)}
 			message, encodeErr := api.NewMessage(api.MessageTypeRequestBody, chunkPayload)
@@ -646,11 +663,13 @@ func normalizeHost(host string) string {
 }
 
 func requestStartFromHTTP(r *http.Request) api.RequestStartPayload {
+	headers := r.Header.Clone()
 	return api.RequestStartPayload{
-		Method:  r.Method,
-		Path:    r.URL.RequestURI(),
-		Host:    normalizeHost(r.Host),
-		Headers: r.Header.Clone(),
+		Method:      r.Method,
+		Path:        r.URL.RequestURI(),
+		Host:        normalizeHost(r.Host),
+		Headers:     headers,
+		UpgradeType: api.UpgradeTypeFromHeaders(headers),
 	}
 }
 

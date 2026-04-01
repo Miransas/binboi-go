@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -33,6 +34,7 @@ type activeRequest struct {
 
 	done       chan struct{}
 	chunksOnce sync.Once
+	rawOnce    sync.Once
 
 	mu           sync.Mutex
 	state        string
@@ -42,6 +44,13 @@ type activeRequest struct {
 	bytesIn      int64
 	bytesOut     int64
 	idleTimer    *time.Timer
+
+	rawMu            sync.Mutex
+	rawInput         chan []byte
+	rawDone          chan struct{}
+	rawConn          net.Conn
+	rawInputClosed   bool
+	upgradeActivated bool
 }
 
 func newActiveRequest(session *TunnelSession, id string, start api.RequestStartPayload, parent context.Context, cancel context.CancelFunc) *activeRequest {
@@ -60,6 +69,10 @@ func newActiveRequest(session *TunnelSession, id string, start api.RequestStartP
 		state:        requestStateActive,
 		createdAt:    now,
 		lastActivity: now,
+	}
+	if api.IsUpgradeRequest(start) {
+		request.rawInput = make(chan []byte, session.flowControl.BufferedFrameCapacity())
+		request.rawDone = make(chan struct{})
 	}
 
 	if idleTimeout := session.flowControl.StreamIdleTimeout(); idleTimeout > 0 {
@@ -103,11 +116,54 @@ func (r *activeRequest) enqueueBody(chunk []byte, idleTimeout time.Duration) err
 	}
 }
 
+func (r *activeRequest) enqueueRawChunk(chunk []byte, idleTimeout time.Duration) error {
+	r.mu.Lock()
+	if r.finished {
+		r.mu.Unlock()
+		return fmt.Errorf("request_body after completion")
+	}
+	r.bytesIn += int64(len(chunk))
+	r.lastActivity = time.Now().UTC()
+	if r.idleTimer != nil {
+		_ = r.idleTimer.Reset(idleTimeout)
+	}
+	rawInput := r.rawInput
+	r.mu.Unlock()
+
+	if rawInput == nil || len(chunk) == 0 {
+		return nil
+	}
+
+	select {
+	case rawInput <- append([]byte(nil), chunk...):
+		return nil
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
+}
+
 func (r *activeRequest) closeRequestBody() error {
 	r.chunksOnce.Do(func() {
 		close(r.bodyChunks)
 	})
 	return nil
+}
+
+func (r *activeRequest) closeRawInput() {
+	r.rawMu.Lock()
+	r.rawInputClosed = true
+	rawInput := r.rawInput
+	rawConn := r.rawConn
+	r.rawMu.Unlock()
+
+	r.rawOnce.Do(func() {
+		if rawInput != nil {
+			close(rawInput)
+		}
+	})
+	if rawConn != nil {
+		_ = closeWrite(rawConn)
+	}
 }
 
 func (r *activeRequest) fail(err error) {
@@ -118,6 +174,18 @@ func (r *activeRequest) fail(err error) {
 		close(r.bodyChunks)
 	})
 	_ = r.bodyWriter.CloseWithError(err)
+
+	r.rawMu.Lock()
+	rawConn := r.rawConn
+	r.rawMu.Unlock()
+	r.rawOnce.Do(func() {
+		if r.rawInput != nil {
+			close(r.rawInput)
+		}
+	})
+	if rawConn != nil {
+		_ = rawConn.Close()
+	}
 }
 
 func (r *activeRequest) markResponseBytes(n int, idleTimeout time.Duration) {
@@ -151,6 +219,22 @@ func (r *activeRequest) snapshot() (string, int64, int64, time.Time, time.Time) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.state, r.bytesIn, r.bytesOut, r.createdAt, r.lastActivity
+}
+
+func (r *activeRequest) isUpgrade() bool {
+	return api.IsUpgradeRequest(r.start)
+}
+
+func (r *activeRequest) setRawConn(conn net.Conn) {
+	r.rawMu.Lock()
+	r.rawConn = conn
+	closed := r.rawInputClosed
+	r.upgradeActivated = true
+	r.rawMu.Unlock()
+
+	if closed {
+		_ = closeWrite(conn)
+	}
 }
 
 func (r *activeRequest) pumpRequestBody() {
@@ -206,8 +290,14 @@ func (s *TunnelSession) handleRequestBody(requestID string, chunk []byte) error 
 		return s.sendProtocolError(requestID, "unknown_request", "request_body received for unknown request")
 	}
 
-	if err := request.enqueueBody(chunk, s.flowControl.StreamIdleTimeout()); err != nil {
-		return err
+	if request.isUpgrade() {
+		if err := request.enqueueRawChunk(chunk, s.flowControl.StreamIdleTimeout()); err != nil {
+			return err
+		}
+	} else {
+		if err := request.enqueueBody(chunk, s.flowControl.StreamIdleTimeout()); err != nil {
+			return err
+		}
 	}
 
 	s.logger.Debug("received request_body chunk",
@@ -222,6 +312,15 @@ func (s *TunnelSession) handleRequestEnd(requestID string) error {
 	request, ok := s.requestByID(requestID)
 	if !ok {
 		return s.sendProtocolError(requestID, "unknown_request", "request_end received for unknown request")
+	}
+
+	if request.isUpgrade() {
+		request.closeRawInput()
+		s.logger.Debug("received request_end for upgraded stream",
+			"tunnel_id", s.registered.TunnelID,
+			"request_id", requestID,
+		)
+		return nil
 	}
 
 	if err := request.closeRequestBody(); err != nil {
@@ -258,6 +357,11 @@ func (s *TunnelSession) handleRequestCancel(requestID string, cancelPayload api.
 func (s *TunnelSession) executeRequest(request *activeRequest) {
 	defer s.finishRequest(request.id)
 
+	if request.isUpgrade() {
+		s.executeUpgradeRequest(request)
+		return
+	}
+
 	responseStart, responseBody, err := s.proxyRequest(request.ctx, request)
 	if err != nil {
 		state := requestStateFailed
@@ -278,79 +382,11 @@ func (s *TunnelSession) executeRequest(request *activeRequest) {
 		return
 	}
 	defer responseBody.Close()
-
-	startMessage, err := api.NewMessage(api.MessageTypeResponseStart, responseStart)
-	if err != nil {
-		request.finish(requestStateFailed)
-		_ = s.sendProtocolError(request.id, "encode_response_start_failed", err.Error())
-		return
-	}
-	startMessage.ID = request.id
-	if err := s.sendStream(request.ctx, request.id, startMessage, false); err != nil {
+	if err := s.sendResponseStart(request, responseStart); err != nil {
 		request.finish(requestStateFailed)
 		return
 	}
-
-	s.logger.Info("sent response_start",
-		"tunnel_id", s.registered.TunnelID,
-		"request_id", request.id,
-		"status", responseStart.Status,
-	)
-
-	buf := make([]byte, api.DefaultBodyChunkSize)
-	chunkIndex := 0
-	for {
-		n, readErr := responseBody.Read(buf)
-		if n > 0 {
-			chunkMessage, err := api.NewMessage(api.MessageTypeResponseBody, api.BodyChunkPayload{
-				Chunk: append([]byte(nil), buf[:n]...),
-			})
-			if err != nil {
-				request.finish(requestStateFailed)
-				_ = s.sendProtocolError(request.id, "encode_response_body_failed", err.Error())
-				return
-			}
-			chunkMessage.ID = request.id
-			if err := s.sendStream(request.ctx, request.id, chunkMessage, false); err != nil {
-				request.finish(requestStateFailed)
-				return
-			}
-			chunkIndex++
-			request.markResponseBytes(n, s.flowControl.StreamIdleTimeout())
-			s.logger.Debug("sent response_body chunk",
-				"tunnel_id", s.registered.TunnelID,
-				"request_id", request.id,
-				"chunk_index", chunkIndex,
-				"chunk_size", n,
-			)
-		}
-
-		if readErr == io.EOF {
-			endMessage, err := api.NewMessage(api.MessageTypeResponseEnd, api.StreamEndPayload{})
-			if err != nil {
-				request.finish(requestStateFailed)
-				_ = s.sendProtocolError(request.id, "encode_response_end_failed", err.Error())
-				return
-			}
-			endMessage.ID = request.id
-			if err := s.sendStream(request.ctx, request.id, endMessage, true); err != nil {
-				request.finish(requestStateFailed)
-				return
-			}
-			request.finish(requestStateFinished)
-			s.logger.Debug("sent response_end",
-				"tunnel_id", s.registered.TunnelID,
-				"request_id", request.id,
-				"chunks", chunkIndex,
-			)
-			return
-		}
-		if readErr != nil {
-			request.finish(requestStateFailed)
-			_ = s.sendProtocolError(request.id, "response_body_read_failed", readErr.Error())
-			return
-		}
-	}
+	s.streamResponseReader(request, responseStart, responseBody)
 }
 
 func (s *TunnelSession) proxyRequest(ctx context.Context, request *activeRequest) (api.ResponseStartPayload, io.ReadCloser, error) {
@@ -433,6 +469,9 @@ func (s *TunnelSession) finishRequest(id string) {
 
 	request.fail(context.Canceled)
 	<-request.pumpDone
+	if request.rawDone != nil && request.upgradeActivated {
+		waitForRawDone(request.rawDone)
+	}
 	state, bytesIn, bytesOut, createdAt, lastActivity := request.snapshot()
 	s.logger.Info("client stream completed",
 		"tunnel_id", s.registered.TunnelID,

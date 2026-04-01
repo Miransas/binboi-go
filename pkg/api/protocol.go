@@ -95,10 +95,11 @@ type PongPayload struct {
 
 // RequestStartPayload describes an incoming HTTP request before body frames arrive.
 type RequestStartPayload struct {
-	Method  string              `json:"method"`
-	Path    string              `json:"path"`
-	Host    string              `json:"host,omitempty"`
-	Headers map[string][]string `json:"headers,omitempty"`
+	Method      string              `json:"method"`
+	Path        string              `json:"path"`
+	Host        string              `json:"host,omitempty"`
+	Headers     map[string][]string `json:"headers,omitempty"`
+	UpgradeType string              `json:"upgrade_type,omitempty"`
 }
 
 // BodyChunkPayload carries a body chunk for a request or response stream.
@@ -111,8 +112,9 @@ type StreamEndPayload struct{}
 
 // ResponseStartPayload describes the upstream response before body frames arrive.
 type ResponseStartPayload struct {
-	Status  int                 `json:"status"`
-	Headers map[string][]string `json:"headers,omitempty"`
+	Status      int                 `json:"status"`
+	Headers     map[string][]string `json:"headers,omitempty"`
+	UpgradeType string              `json:"upgrade_type,omitempty"`
 }
 
 // RequestCancelPayload cancels an in-flight request stream.
@@ -240,4 +242,60 @@ func (f FlowControl) StreamTimeout() time.Duration {
 // StreamIdleTimeout returns the maximum allowed idle period for a stream.
 func (f FlowControl) StreamIdleTimeout() time.Duration {
 	return time.Duration(f.Normalize().StreamIdleTimeoutSeconds) * time.Second
+}
+
+// HeaderValue returns the first header value for a case-insensitive header name.
+func HeaderValue(headers map[string][]string, name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return ""
+	}
+
+	for key, values := range headers {
+		if strings.ToLower(key) != name || len(values) == 0 {
+			continue
+		}
+		return strings.TrimSpace(values[0])
+	}
+	return ""
+}
+
+// HeaderHasToken reports whether a comma-separated header contains the given token.
+func HeaderHasToken(headers map[string][]string, name, token string) bool {
+	token = strings.TrimSpace(strings.ToLower(token))
+	if token == "" {
+		return false
+	}
+
+	for key, values := range headers {
+		if strings.ToLower(key) != strings.ToLower(name) {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				if strings.ToLower(strings.TrimSpace(part)) == token {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// UpgradeTypeFromHeaders returns the normalized upgrade token when headers request an upgrade.
+func UpgradeTypeFromHeaders(headers map[string][]string) string {
+	if !HeaderHasToken(headers, "Connection", "upgrade") {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(HeaderValue(headers, "Upgrade")))
+}
+
+// IsUpgradeRequest reports whether a request start enters HTTP upgrade mode.
+func IsUpgradeRequest(start RequestStartPayload) bool {
+	return strings.TrimSpace(start.UpgradeType) != ""
+}
+
+// IsUpgradeResponse reports whether a response start accepted HTTP upgrade mode.
+func IsUpgradeResponse(start ResponseStartPayload) bool {
+	return start.Status == 101 && strings.TrimSpace(start.UpgradeType) != ""
 }

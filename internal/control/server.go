@@ -1,12 +1,14 @@
 package control
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -183,50 +185,72 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		"path", r.URL.RequestURI(),
 	)
 
+	if api.UpgradeTypeFromHeaders(r.Header) != "" {
+		s.handleUpgradeTunnelRequest(w, r, host)
+		return
+	}
+
 	pending, err := s.protocolServer.ForwardRequest(r.Context(), host, r)
 	if err != nil {
-		switch {
-		case errors.Is(err, errTunnelNotFound):
-			writeError(w, http.StatusNotFound, "no active tunnel for host")
-		case errors.Is(err, errTunnelUnavailable):
-			writeError(w, http.StatusServiceUnavailable, "tunnel is currently disconnected")
-		case errors.Is(err, errTunnelUnsupported):
-			writeError(w, http.StatusNotImplemented, "tunnel protocol does not support HTTP forwarding yet")
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errStreamTimedOut):
-			writeError(w, http.StatusGatewayTimeout, "tunnel request timed out")
-		case errors.Is(err, errStreamIdleTimeout):
-			writeError(w, http.StatusGatewayTimeout, "tunnel stream went idle")
-		case errors.Is(err, context.Canceled):
-			writeError(w, http.StatusGatewayTimeout, "client closed request")
-		default:
-			s.logger.Warn("failed to forward request",
-				"host", host,
-				"method", r.Method,
-				"path", r.URL.RequestURI(),
-				"error", err,
-			)
-			writeError(w, http.StatusBadGateway, "failed to forward tunneled request")
-		}
+		s.writeTunnelForwardError(w, r, host, err)
 		return
 	}
 
+	start, ok := s.awaitForwardResponseStart(w, r, host, pending)
+	if !ok {
+		return
+	}
+
+	s.streamForwardedHTTPResponse(w, r, host, pending, start)
+}
+
+func (s *Server) writeTunnelForwardError(w http.ResponseWriter, r *http.Request, host string, err error) {
+	switch {
+	case errors.Is(err, errTunnelNotFound):
+		writeError(w, http.StatusNotFound, "no active tunnel for host")
+	case errors.Is(err, errTunnelUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "tunnel is currently disconnected")
+	case errors.Is(err, errTunnelUnsupported):
+		writeError(w, http.StatusNotImplemented, "tunnel protocol does not support HTTP forwarding yet")
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errStreamTimedOut):
+		writeError(w, http.StatusGatewayTimeout, "tunnel request timed out")
+	case errors.Is(err, errStreamIdleTimeout):
+		writeError(w, http.StatusGatewayTimeout, "tunnel stream went idle")
+	case errors.Is(err, context.Canceled):
+		writeError(w, http.StatusGatewayTimeout, "client closed request")
+	default:
+		s.logger.Warn("failed to forward request",
+			"host", host,
+			"method", r.Method,
+			"path", r.URL.RequestURI(),
+			"error", err,
+		)
+		writeError(w, http.StatusBadGateway, "failed to forward tunneled request")
+	}
+}
+
+func (s *Server) awaitForwardResponseStart(w http.ResponseWriter, r *http.Request, host string, pending *pendingRequest) (api.ResponseStartPayload, bool) {
 	start, err := pending.waitForResponseStart()
-	if err != nil {
-		switch {
-		case errors.Is(err, errTunnelUnavailable):
-			writeError(w, http.StatusServiceUnavailable, "tunnel disconnected before response_start")
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errStreamTimedOut):
-			writeError(w, http.StatusGatewayTimeout, "tunnel response timed out")
-		case errors.Is(err, errStreamIdleTimeout):
-			writeError(w, http.StatusGatewayTimeout, "tunnel response went idle")
-		case errors.Is(err, context.Canceled):
-			writeError(w, http.StatusGatewayTimeout, "client closed request")
-		default:
-			writeError(w, http.StatusBadGateway, "failed before response_start")
-		}
-		return
+	if err == nil {
+		return start, true
 	}
 
+	switch {
+	case errors.Is(err, errTunnelUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "tunnel disconnected before response_start")
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errStreamTimedOut):
+		writeError(w, http.StatusGatewayTimeout, "tunnel response timed out")
+	case errors.Is(err, errStreamIdleTimeout):
+		writeError(w, http.StatusGatewayTimeout, "tunnel response went idle")
+	case errors.Is(err, context.Canceled):
+		writeError(w, http.StatusGatewayTimeout, "client closed request")
+	default:
+		writeError(w, http.StatusBadGateway, "failed before response_start")
+	}
+	return api.ResponseStartPayload{}, false
+}
+
+func (s *Server) streamForwardedHTTPResponse(w http.ResponseWriter, r *http.Request, host string, pending *pendingRequest, start api.ResponseStartPayload) {
 	for key, values := range start.Headers {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -301,4 +325,12 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return hijacker.Hijack()
 }

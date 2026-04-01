@@ -37,11 +37,12 @@ The current scaffold is intentionally modest: it implements a working control pl
 5. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
 6. Incoming HTTP requests are converted into framed `request_*` protocol messages, forwarded to the connected client, proxied to the local service, and returned as framed `response_*` messages.
 7. The server tracks multiple in-flight requests per tunnel by request ID while the client processes request messages concurrently.
-8. One fair outbound dispatcher per tunnel multiplexes stream frames in round-robin order so large bodies do not monopolize the connection.
+8. One fair outbound dispatcher per tunnel multiplexes stream frames in round-robin order so large bodies and upgraded streams do not monopolize the connection.
 9. Flow control limits bound active streams and per-stream buffered chunks, which lets backpressure propagate naturally when either side slows down.
-10. Cancellation is propagated with request-scoped cancel messages so user disconnects, idle streams, or timeouts can abort local upstream work.
-11. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
-12. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
+10. HTTP upgrade requests such as WebSocket handshakes are detected from the forwarded headers, proxied to the local upstream, and then switched into long-lived bidirectional raw byte streams while keeping the same request ID as the stream ID.
+11. Cancellation is propagated with request-scoped cancel messages so user disconnects, idle streams, or timeouts can abort local upstream work.
+12. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
+13. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
 
 ## Why The Implementation Is Intentionally Small
 
@@ -64,6 +65,7 @@ The tunnel and proxy layers therefore expose realistic integration points withou
 - metrics and tracing
 - richer client ergonomics
 - richer flow windows and weighted multiplex scheduling on top of the current framed stream transport
+- long-lived upgraded stream resume semantics across reconnects
 - richer resume semantics such as expiry windows and request cancellation
 
 ## Design Principles
