@@ -1,0 +1,20 @@
+{
+  "service": {
+    "name": "binboid",
+    "environment": "docker-local"
+  },
+  "control": {
+    "listen_address": ":8080"
+  },
+  "tunnel": {
+    "public_host": "docker.binboi.local",
+    "default_protocol": "http"
+  },
+  "proxy": {
+    "forwarded_header": "X-Binboi-Session"
+  },
+  "observability": {
+    "level": "info",
+    "format": "text"
+  }
+}

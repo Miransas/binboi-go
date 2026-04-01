@@ -1,0 +1,17 @@
+services:
+  binboid:
+    image: golang:1.25
+    working_dir: /workspace
+    command: ["go", "run", "./cmd/binboid", "-config", "/workspace/examples/docker-basic/binboid.json"]
+    volumes:
+      - ../..:/workspace
+    ports:
+      - "8080:8080"
+    depends_on:
+      - echo
+
+  echo:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen", ":5678", "-text", "hello from docker-basic"]
+    ports:
+      - "5678:5678"

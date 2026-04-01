@@ -1,0 +1,199 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/sardorazimov/binboi-go/internal/config"
+	"github.com/sardorazimov/binboi-go/pkg/api"
+	"github.com/sardorazimov/binboi-go/pkg/client"
+)
+
+var (
+	version = "0.1.0-dev"
+	commit  = "unknown"
+)
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "binboi: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string, stdout io.Writer, stderr io.Writer) error {
+	if len(args) == 0 {
+		printUsage(stderr)
+		return nil
+	}
+
+	switch args[0] {
+	case "version":
+		fmt.Fprintf(stdout, "binboi %s (%s)\n", version, commit)
+		return nil
+	case "config":
+		return runConfig(args[1:], stdout)
+	case "health":
+		return runHealth(args[1:], stdout)
+	case "session":
+		return runSession(args[1:], stdout)
+	case "help", "-h", "--help":
+		printUsage(stdout)
+		return nil
+	default:
+		printUsage(stderr)
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "binboi is the Binboi engine CLI.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  binboi version")
+	fmt.Fprintln(w, "  binboi config init -path ./binboid.json")
+	fmt.Fprintln(w, "  binboi config print-sample")
+	fmt.Fprintln(w, "  binboi health -server http://127.0.0.1:8080")
+	fmt.Fprintln(w, "  binboi session create -name local-http -target http://127.0.0.1:3000")
+	fmt.Fprintln(w, "  binboi session list")
+}
+
+func runConfig(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("config requires a subcommand: init or print-sample")
+	}
+
+	switch args[0] {
+	case "init":
+		fs := flag.NewFlagSet("config init", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		path := fs.String("path", "./binboid.json", "config file path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+
+		cfg := config.Default()
+		if err := config.Save(*path, cfg); err != nil {
+			return err
+		}
+
+		fmt.Fprintf(stdout, "wrote sample config to %s\n", *path)
+		return nil
+	case "print-sample":
+		cfg := config.Default()
+		return writeJSON(stdout, cfg)
+	default:
+		return fmt.Errorf("unknown config subcommand %q", args[0])
+	}
+}
+
+func runHealth(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("health", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverURL := fs.String("server", "http://127.0.0.1:8080", "control plane base URL")
+	timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cli, err := client.New(*serverURL)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	health, err := cli.Health(ctx)
+	if err != nil {
+		return err
+	}
+
+	return writeJSON(stdout, health)
+}
+
+func runSession(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("session requires a subcommand: create or list")
+	}
+
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("session create", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		serverURL := fs.String("server", "http://127.0.0.1:8080", "control plane base URL")
+		name := fs.String("name", "", "human-friendly session name")
+		target := fs.String("target", "", "upstream target URL, for example http://127.0.0.1:3000")
+		protocol := fs.String("protocol", "", "optional explicit protocol override")
+		token := fs.String("token", "", "optional control-plane token for future auth wiring")
+		timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+
+		if strings.TrimSpace(*name) == "" {
+			return errors.New("name is required")
+		}
+		if strings.TrimSpace(*target) == "" {
+			return errors.New("target is required")
+		}
+
+		cli, err := client.New(*serverURL)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+
+		session, err := cli.CreateSession(ctx, api.CreateSessionRequest{
+			Name:     *name,
+			Target:   *target,
+			Protocol: *protocol,
+			Token:    *token,
+		})
+		if err != nil {
+			return err
+		}
+
+		return writeJSON(stdout, session)
+	case "list":
+		fs := flag.NewFlagSet("session list", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		serverURL := fs.String("server", "http://127.0.0.1:8080", "control plane base URL")
+		timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+
+		cli, err := client.New(*serverURL)
+		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+
+		sessions, err := cli.ListSessions(ctx)
+		if err != nil {
+			return err
+		}
+
+		return writeJSON(stdout, api.ListSessionsResponse{Sessions: sessions})
+	default:
+		return fmt.Errorf("unknown session subcommand %q", args[0])
+	}
+}
+
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
