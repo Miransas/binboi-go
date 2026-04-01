@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/config"
 	"github.com/sardorazimov/binboi-go/internal/observability"
 	"github.com/sardorazimov/binboi-go/pkg/api"
@@ -47,6 +48,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return runTunnelCommand(args[0], args[1:], stdout)
 	case "config":
 		return runConfig(args[1:], stdout)
+	case "auth":
+		return runAuth(args[1:], stdout)
 	case "health":
 		return runHealth(args[1:], stdout)
 	case "session":
@@ -69,6 +72,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  binboi tcp 5432 -server 127.0.0.1:8081")
 	fmt.Fprintln(w, "  binboi config init -path ./binboid.json")
 	fmt.Fprintln(w, "  binboi config print-sample")
+	fmt.Fprintln(w, "  binboi auth login -token <raw_token>")
+	fmt.Fprintln(w, "  binboi auth show")
 	fmt.Fprintln(w, "  binboi health -server http://127.0.0.1:8080")
 	fmt.Fprintln(w, "  binboi session create -name local-http -target http://127.0.0.1:3000")
 	fmt.Fprintln(w, "  binboi session list")
@@ -88,6 +93,7 @@ func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
 	fs.SetOutput(io.Discard)
 	serverAddr := fs.String("server", "127.0.0.1:8081", "daemon stream control address")
 	token := fs.String("token", "", "optional auth token")
+	credentialsPath := fs.String("credentials", "", "optional credentials file override")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -103,6 +109,10 @@ func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
 	}
 
 	hostname, _ := os.Hostname()
+	authToken, err := resolveTunnelToken(*token, *credentialsPath)
+	if err != nil {
+		return err
+	}
 
 	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -110,7 +120,7 @@ func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
 	registerPayload := api.RegisterPayload{
 		Protocol:  protocol,
 		LocalPort: localPort,
-		AuthToken: *token,
+		AuthToken: authToken,
 		Metadata: api.ClientMetadata{
 			ClientVersion: version,
 			Hostname:      hostname,
@@ -127,6 +137,124 @@ func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
 		_ = writeJSON(stdout, registered)
 		printed = true
 	})
+}
+
+func runAuth(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("auth requires a subcommand: login, logout, or show")
+	}
+
+	switch args[0] {
+	case "login":
+		fs := flag.NewFlagSet("auth login", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		token := fs.String("token", "", "raw auth token")
+		path := fs.String("path", "", "optional credentials file path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if strings.TrimSpace(*token) == "" {
+			return errors.New("token is required")
+		}
+		if _, err := auth.PrefixFromRawToken(*token); err != nil {
+			return err
+		}
+
+		credentialsPath, err := credentialsPathOrDefault(*path)
+		if err != nil {
+			return err
+		}
+		creds := auth.LocalCredentials{Token: strings.TrimSpace(*token)}
+		if err := auth.SaveLocalCredentials(credentialsPath, creds); err != nil {
+			return err
+		}
+
+		saved, err := auth.LoadLocalCredentials(credentialsPath)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{
+			"path":       credentialsPath,
+			"token_hint": saved.TokenHint,
+			"saved_at":   saved.SavedAt,
+		})
+	case "logout":
+		fs := flag.NewFlagSet("auth logout", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		path := fs.String("path", "", "optional credentials file path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+
+		credentialsPath, err := credentialsPathOrDefault(*path)
+		if err != nil {
+			return err
+		}
+		if err := auth.ClearLocalCredentials(credentialsPath); err != nil {
+			return err
+		}
+		return writeJSON(stdout, map[string]any{
+			"path":    credentialsPath,
+			"cleared": true,
+		})
+	case "show":
+		fs := flag.NewFlagSet("auth show", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		path := fs.String("path", "", "optional credentials file path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+
+		credentialsPath, err := credentialsPathOrDefault(*path)
+		if err != nil {
+			return err
+		}
+		creds, err := auth.LoadLocalCredentials(credentialsPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return writeJSON(stdout, map[string]any{
+					"path":    credentialsPath,
+					"present": false,
+				})
+			}
+			return err
+		}
+		return writeJSON(stdout, map[string]any{
+			"path":       credentialsPath,
+			"present":    true,
+			"token_hint": creds.TokenHint,
+			"saved_at":   creds.SavedAt,
+		})
+	default:
+		return fmt.Errorf("unknown auth subcommand %q", args[0])
+	}
+}
+
+func resolveTunnelToken(explicitToken, explicitPath string) (string, error) {
+	if strings.TrimSpace(explicitToken) != "" {
+		return strings.TrimSpace(explicitToken), nil
+	}
+
+	credentialsPath, err := credentialsPathOrDefault(explicitPath)
+	if err != nil {
+		return "", err
+	}
+
+	creds, err := auth.LoadLocalCredentials(credentialsPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(creds.Token), nil
+}
+
+func credentialsPathOrDefault(path string) (string, error) {
+	if strings.TrimSpace(path) != "" {
+		return path, nil
+	}
+	return auth.DefaultLocalCredentialsPath()
 }
 
 func runConfig(args []string, stdout io.Writer) error {

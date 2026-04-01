@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/session"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
@@ -23,19 +24,21 @@ type protocolServer struct {
 	flowControl       api.FlowControl
 	logger            *slog.Logger
 	manager           *session.Manager
+	validator         TokenValidator
 
 	mu       sync.RWMutex
 	listener net.Listener
 	peers    map[string]*protocolPeer
 }
 
-func newProtocolServer(address string, heartbeatInterval time.Duration, flowControl api.FlowControl, logger *slog.Logger, manager *session.Manager) *protocolServer {
+func newProtocolServer(address string, heartbeatInterval time.Duration, flowControl api.FlowControl, logger *slog.Logger, manager *session.Manager, validator TokenValidator) *protocolServer {
 	return &protocolServer{
 		address:           address,
 		heartbeatInterval: heartbeatInterval,
 		flowControl:       flowControl.Normalize(),
 		logger:            logger,
 		manager:           manager,
+		validator:         validator,
 		peers:             make(map[string]*protocolPeer),
 	}
 }
@@ -173,10 +176,37 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	var principal auth.Principal
+	if s.validator != nil {
+		principal, err = s.validator.Validate(ctx, register.AuthToken)
+		if err != nil {
+			errorCode := "invalid_token"
+			switch {
+			case errors.Is(err, auth.ErrTokenRequired):
+				errorCode = "token_required"
+			case errors.Is(err, auth.ErrRevokedToken):
+				errorCode = "revoked_token"
+			case errors.Is(err, auth.ErrInvalidToken):
+				errorCode = "invalid_token"
+			}
+			s.sendProtocolError(conn, codec, "", errorCode, err.Error())
+			s.logger.Warn("tunnel authentication failed",
+				"remote_addr", remoteAddr,
+				"protocol", register.Protocol,
+				"local_port", register.LocalPort,
+				"resume_tunnel_id", register.ResumeTunnelID,
+				"error", err,
+			)
+			return
+		}
+	}
+
 	registerResult, err := s.manager.RegisterTunnel(ctx, session.RegisterRequest{
 		Protocol:       register.Protocol,
 		LocalPort:      register.LocalPort,
-		AuthToken:      register.AuthToken,
+		UserID:         principal.UserID,
+		TokenID:        principal.TokenID,
+		TokenPrefix:    principal.Prefix,
 		Metadata:       register.Metadata,
 		Conn:           conn,
 		ResumeTunnelID: register.ResumeTunnelID,
@@ -234,6 +264,8 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 	s.logger.Info("tunnel registration succeeded",
 		"remote_addr", remoteAddr,
 		"tunnel_id", sessionID,
+		"user_id", principal.UserID,
+		"token_prefix", principal.Prefix,
 		"protocol", registeredSession.Protocol,
 		"local_port", registeredSession.LocalPort,
 		"public_url", registeredSession.PublicURL,

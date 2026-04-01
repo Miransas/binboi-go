@@ -29,21 +29,35 @@ go run ./cmd/binboid
 The daemon starts a lightweight control API on `:8080` by default.
 The daemon also starts a JSON-over-TCP stream control listener on `:8081` by default.
 
-### 2. Check health
+### 2. Create an auth token
+
+```bash
+go run ./cmd/binboid token create -user user_123
+```
+
+The daemon returns the raw token exactly once and stores only its hash in the local token database.
+
+### 3. Save the token in the CLI
+
+```bash
+go run ./cmd/binboi auth login -token <raw_token>
+```
+
+### 4. Check health
 
 ```bash
 go run ./cmd/binboi health
 ```
 
-### 3. Start a live tunnel control session
+### 5. Start a live tunnel control session
 
 ```bash
 go run ./cmd/binboi http 3000
 ```
 
-That command connects to the daemon, sends a `register` message, receives tunnel metadata, keeps the control connection alive with heartbeat `ping`/`pong` messages, can proxy basic HTTP requests and upgraded WebSocket connections back to your local service, automatically retries with session resume when the control connection drops, and applies bounded per-stream flow control for safer multiplexing.
+That command connects to the daemon, automatically includes the locally saved auth token in the `register` handshake, receives tunnel metadata, keeps the control connection alive with heartbeat `ping`/`pong` messages, can proxy basic HTTP requests and upgraded WebSocket connections back to your local service, automatically retries with session resume when the control connection drops, and applies bounded per-stream flow control for safer multiplexing.
 
-### 4. Generate a config file
+### 6. Generate a config file
 
 ```bash
 go run ./cmd/binboi config init -path ./binboid.json
@@ -69,21 +83,28 @@ The private Binboi product repository can depend on this engine, embed it, wrap 
 
 ## Development Notes
 
-- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, upgraded WebSocket tunneling, framed body streaming, and bounded flow control with fair per-stream scheduling.
+- The current scaffold implements a working HTTP API, stream control protocol, hashed token-based client auth with in-memory validation cache, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, upgraded WebSocket tunneling, framed body streaming, and bounded flow control with fair per-stream scheduling.
 - The forwarding layer is still intentionally modest: HTTP and WebSocket traffic work over framed streams with backpressure and idle timeouts, but richer flow windows, binary framing, and more advanced protocol adapters are still future work.
 - Daemon flow limits live under `control.flow_control` in the JSON config and control active streams, per-stream buffering, stream timeout, and idle timeout behavior.
+- Client auth settings live under `auth` in the daemon config and control the token database path, validation cache TTL, and `last_used_at` persistence cadence.
 - The codebase favors standard library dependencies to keep the engine portable and easy to audit.
 - Folder-level README files are included to make each major area understandable on first read.
 
 ## Current Commands
 
 - `binboi version`
+- `binboi auth login`
+- `binboi auth logout`
+- `binboi auth show`
 - `binboi http 3000`
 - `binboi health`
 - `binboi config init`
 - `binboi config print-sample`
 - `binboi session create`
 - `binboi session list`
+- `binboid token create`
+- `binboid token list`
+- `binboid token revoke`
 
 ## Examples
 

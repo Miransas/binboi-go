@@ -13,9 +13,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/session"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
+
+// TokenValidator authenticates raw tokens during the stream register handshake.
+type TokenValidator interface {
+	Validate(ctx context.Context, rawToken string) (auth.Principal, error)
+}
 
 // ServerConfig contains the daemon's HTTP and stream control-plane settings.
 type ServerConfig struct {
@@ -23,6 +29,7 @@ type ServerConfig struct {
 	ProtocolAddress   string
 	HeartbeatInterval time.Duration
 	FlowControl       api.FlowControl
+	AuthValidator     TokenValidator
 	Name              string
 	Version           string
 }
@@ -54,7 +61,7 @@ func NewServer(cfg ServerConfig, logger *slog.Logger, manager *session.Manager) 
 		Handler:           loggingMiddleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, cfg.FlowControl.Normalize(), logger, manager)
+	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, cfg.FlowControl.Normalize(), logger, manager, cfg.AuthValidator)
 
 	return server
 }

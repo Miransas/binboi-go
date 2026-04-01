@@ -29,7 +29,9 @@ var (
 type RegisterRequest struct {
 	Protocol       string
 	LocalPort      int
-	AuthToken      string
+	UserID         string
+	TokenID        string
+	TokenPrefix    string
 	Metadata       api.ClientMetadata
 	Conn           net.Conn
 	ResumeTunnelID string
@@ -46,7 +48,9 @@ type record struct {
 	session     api.Session
 	conn        net.Conn
 	remoteAddr  string
-	authToken   string
+	userID      string
+	tokenID     string
+	tokenPrefix string
 	metadata    api.ClientMetadata
 	resumeToken string
 }
@@ -126,7 +130,9 @@ func (m *Manager) RegisterTunnel(_ context.Context, req RegisterRequest) (Resume
 		lastSeen:      &now,
 		conn:          req.Conn,
 		remoteAddr:    req.Conn.RemoteAddr().String(),
-		authToken:     req.AuthToken,
+		userID:        req.UserID,
+		tokenID:       req.TokenID,
+		tokenPrefix:   req.TokenPrefix,
 		metadata:      req.Metadata,
 		createdAt:     now,
 	})
@@ -151,14 +157,22 @@ func (m *Manager) resumeTunnel(req RegisterRequest) (api.Session, error) {
 	if record.session.Protocol != req.Protocol || record.session.LocalPort != req.LocalPort {
 		return api.Session{}, ErrInvalidResume
 	}
+	if record.tokenID != "" || req.TokenID != "" || record.userID != "" || req.UserID != "" {
+		if record.tokenID != req.TokenID || record.userID != req.UserID {
+			return api.Session{}, ErrInvalidResume
+		}
+	}
 
 	now := time.Now().UTC()
 	record.conn = req.Conn
 	record.remoteAddr = req.Conn.RemoteAddr().String()
-	record.authToken = req.AuthToken
+	record.userID = req.UserID
+	record.tokenID = req.TokenID
+	record.tokenPrefix = req.TokenPrefix
 	record.metadata = req.Metadata
 	record.session.Status = "connected"
 	record.session.Connection = "connected"
+	record.session.UserID = req.UserID
 	record.session.LastSeen = &now
 	record.session.LastHeartbeat = &now
 
@@ -275,7 +289,9 @@ type sessionParams struct {
 	lastSeen      *time.Time
 	conn          net.Conn
 	remoteAddr    string
-	authToken     string
+	userID        string
+	tokenID       string
+	tokenPrefix   string
 	metadata      api.ClientMetadata
 	createdAt     time.Time
 }
@@ -301,6 +317,7 @@ func (m *Manager) storeSession(target transport.Target, params sessionParams) (a
 	session := api.Session{
 		ID:            sessionID,
 		Name:          params.name,
+		UserID:        params.userID,
 		Protocol:      target.Protocol,
 		Target:        target.URL.String(),
 		LocalPort:     params.localPort,
@@ -335,7 +352,9 @@ func (m *Manager) storeSession(target transport.Target, params sessionParams) (a
 		session:     session,
 		conn:        params.conn,
 		remoteAddr:  params.remoteAddr,
-		authToken:   params.authToken,
+		userID:      params.userID,
+		tokenID:     params.tokenID,
+		tokenPrefix: params.tokenPrefix,
 		metadata:    params.metadata,
 		resumeToken: resumeToken,
 	}

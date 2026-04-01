@@ -15,6 +15,7 @@ The current scaffold is intentionally modest: it implements a working control pl
 
 ### Internal Packages
 
+- `internal/auth`: token generation, hashed token storage, validation cache, local CLI credential helpers
 - `internal/config`: runtime configuration defaults, loading, saving, validation
 - `internal/control`: HTTP control API plus the stream protocol server for register and heartbeat flows
 - `internal/session`: orchestration layer that validates requests and stores session state
@@ -33,16 +34,18 @@ The current scaffold is intentionally modest: it implements a working control pl
 1. `binboid` starts with config defaults or a JSON config file.
 2. The daemon creates a logger and an in-memory session manager.
 3. The control plane exposes `GET /healthz`, `GET/POST /v1/sessions`, and a JSON-over-TCP stream listener.
-4. `binboi http 3000` connects to the stream listener, sends a `register` message, and receives a `registered` response with tunnel metadata.
-5. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
-6. Incoming HTTP requests are converted into framed `request_*` protocol messages, forwarded to the connected client, proxied to the local service, and returned as framed `response_*` messages.
-7. The server tracks multiple in-flight requests per tunnel by request ID while the client processes request messages concurrently.
-8. One fair outbound dispatcher per tunnel multiplexes stream frames in round-robin order so large bodies and upgraded streams do not monopolize the connection.
-9. Flow control limits bound active streams and per-stream buffered chunks, which lets backpressure propagate naturally when either side slows down.
-10. HTTP upgrade requests such as WebSocket handshakes are detected from the forwarded headers, proxied to the local upstream, and then switched into long-lived bidirectional raw byte streams while keeping the same request ID as the stream ID.
-11. Cancellation is propagated with request-scoped cancel messages so user disconnects, idle streams, or timeouts can abort local upstream work.
-12. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
-13. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
+4. `binboid token create -user ...` generates a random raw token once, stores only its SHA-256 hash and metadata in the token database, and exposes the raw token for operator distribution.
+5. `binboi auth login -token ...` stores the raw token locally with restricted file permissions so tunnel commands can reuse it automatically.
+6. `binboi http 3000` connects to the stream listener, sends a `register` message with the token, and the daemon validates it through the in-memory auth cache backed by the token database before returning a `registered` response.
+7. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
+8. Incoming HTTP requests are converted into framed `request_*` protocol messages, forwarded to the connected client, proxied to the local service, and returned as framed `response_*` messages.
+9. The server tracks multiple in-flight requests per tunnel by request ID while the client processes request messages concurrently.
+10. One fair outbound dispatcher per tunnel multiplexes stream frames in round-robin order so large bodies and upgraded streams do not monopolize the connection.
+11. Flow control limits bound active streams and per-stream buffered chunks, which lets backpressure propagate naturally when either side slows down.
+12. HTTP upgrade requests such as WebSocket handshakes are detected from the forwarded headers, proxied to the local upstream, and then switched into long-lived bidirectional raw byte streams while keeping the same request ID as the stream ID.
+13. Cancellation is propagated with request-scoped cancel messages so user disconnects, idle streams, or timeouts can abort local upstream work.
+14. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
+15. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
 
 ## Why The Implementation Is Intentionally Small
 
@@ -64,6 +67,7 @@ The tunnel and proxy layers therefore expose realistic integration points withou
 - proxy transport adapters
 - metrics and tracing
 - richer client ergonomics
+- token scope models and daemon-to-database persistence beyond the current local file store
 - richer flow windows and weighted multiplex scheduling on top of the current framed stream transport
 - long-lived upgraded stream resume semantics across reconnects
 - richer resume semantics such as expiry windows and request cancellation

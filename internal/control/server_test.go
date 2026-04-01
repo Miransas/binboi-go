@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sardorazimov/binboi-go/internal/auth"
 	"github.com/sardorazimov/binboi-go/internal/session"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 	"github.com/sardorazimov/binboi-go/pkg/client"
@@ -80,7 +82,7 @@ func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
-	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager)
+	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -143,6 +145,95 @@ func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 	}
 
 	waitForConnectionState(t, manager, initial.TunnelID, "disconnected")
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
+func TestProtocolRegisterRequiresValidToken(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+
+	store := auth.NewStore(t.TempDir() + "/tokens.json")
+	if err := store.Ensure(); err != nil {
+		t.Fatalf("ensure token store: %v", err)
+	}
+	created, err := store.CreateToken(context.Background(), "user-123")
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	validator := auth.NewValidator(store, auth.ValidatorConfig{
+		CacheTTL:               time.Second,
+		LastUsedUpdateInterval: time.Millisecond,
+	}, logger)
+
+	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager, validator)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- stream.Run(ctx)
+	}()
+
+	address := waitForAddress(t, stream)
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: 3000,
+		AuthToken: created.RawToken,
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err != nil {
+		t.Fatalf("connect with valid token: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	waitForConnectionState(t, manager, tunnelSession.Registered().TunnelID, "connected")
+
+	sessions := manager.List(context.Background())
+	if len(sessions) != 1 {
+		t.Fatalf("session count mismatch: got %d want 1", len(sessions))
+	}
+	if sessions[0].UserID != "user-123" {
+		t.Fatalf("user ID mismatch: got %q want %q", sessions[0].UserID, "user-123")
+	}
+
+	stop()
+	if err := <-runDone; err != nil {
+		t.Fatalf("run tunnel session: %v", err)
+	}
+
+	_, err = tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: 3000,
+		AuthToken: "bin_live_dead_invalid",
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err == nil {
+		t.Fatal("expected invalid token error")
+	}
+	var protocolErr *client.ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("expected protocol error, got %T", err)
+	}
+	if protocolErr.Code != "invalid_token" {
+		t.Fatalf("protocol error code mismatch: got %q want %q", protocolErr.Code, "invalid_token")
+	}
 
 	cancel()
 	if err := <-errCh; err != nil {

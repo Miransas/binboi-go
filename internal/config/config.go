@@ -16,6 +16,7 @@ type Config struct {
 	Control       ControlConfig       `json:"control"`
 	Tunnel        TunnelConfig        `json:"tunnel"`
 	Proxy         ProxyConfig         `json:"proxy"`
+	Auth          AuthConfig          `json:"auth"`
 	Observability ObservabilityConfig `json:"observability"`
 }
 
@@ -44,6 +45,13 @@ type ProxyConfig struct {
 	ForwardedHeader string `json:"forwarded_header"`
 }
 
+// AuthConfig controls token validation and cache behavior for client auth.
+type AuthConfig struct {
+	DatabasePath                  string `json:"database_path"`
+	CacheTTLSeconds               int    `json:"cache_ttl_seconds"`
+	LastUsedUpdateIntervalSeconds int    `json:"last_used_update_interval_seconds"`
+}
+
 // ObservabilityConfig controls basic logging output.
 type ObservabilityConfig struct {
 	Level  string `json:"level"`
@@ -69,6 +77,11 @@ func Default() Config {
 		},
 		Proxy: ProxyConfig{
 			ForwardedHeader: "X-Binboi-Session",
+		},
+		Auth: AuthConfig{
+			DatabasePath:                  "./data/binboi-tokens.json",
+			CacheTTLSeconds:               30,
+			LastUsedUpdateIntervalSeconds: 60,
 		},
 		Observability: ObservabilityConfig{
 			Level:  "info",
@@ -153,6 +166,15 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Tunnel.DefaultProtocol == "" {
 		return errors.New("tunnel.default_protocol is required")
+	}
+	if cfg.Auth.DatabasePath == "" {
+		return errors.New("auth.database_path is required")
+	}
+	if cfg.Auth.CacheTTLSeconds <= 0 {
+		return errors.New("auth.cache_ttl_seconds must be greater than zero")
+	}
+	if cfg.Auth.LastUsedUpdateIntervalSeconds <= 0 {
+		return errors.New("auth.last_used_update_interval_seconds must be greater than zero")
 	}
 	if cfg.Observability.Level == "" {
 		return errors.New("observability.level is required")

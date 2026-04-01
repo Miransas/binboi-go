@@ -21,6 +21,11 @@
   "proxy": {
     "forwarded_header": "X-Binboi-Session"
   },
+  "auth": {
+    "database_path": "./data/binboi-tokens.json",
+    "cache_ttl_seconds": 30,
+    "last_used_update_interval_seconds": 60
+  },
   "observability": {
     "level": "info",
     "format": "text"
