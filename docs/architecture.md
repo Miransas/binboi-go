@@ -11,12 +11,12 @@ The current scaffold is intentionally modest: it implements a working control pl
 ### Entrypoints
 
 - `cmd/binboi`: operator CLI for local workflows and control-plane requests
-- `cmd/binboid`: daemon entrypoint that loads config, starts logging, and serves the control API
+- `cmd/binboid`: daemon entrypoint that loads config, starts logging, and serves the control plane
 
 ### Internal Packages
 
 - `internal/config`: runtime configuration defaults, loading, saving, validation
-- `internal/control`: HTTP control API for health and session lifecycle endpoints
+- `internal/control`: HTTP control API plus the stream protocol server for register and heartbeat flows
 - `internal/session`: orchestration layer that validates requests and stores session state
 - `internal/transport`: target parsing and protocol inference
 - `internal/proxy`: route metadata planning
@@ -25,16 +25,17 @@ The current scaffold is intentionally modest: it implements a working control pl
 
 ### Public Packages
 
-- `pkg/api`: shared request/response types
-- `pkg/client`: external client for the control API
+- `pkg/api`: shared HTTP and stream protocol message types
+- `pkg/client`: external client for the HTTP API and stream control protocol
 
 ## Current Data Flow
 
 1. `binboid` starts with config defaults or a JSON config file.
 2. The daemon creates a logger and an in-memory session manager.
-3. The control API exposes `GET /healthz` and `GET/POST /v1/sessions`.
-4. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
-5. The resulting session record is returned to clients and stored in memory.
+3. The control plane exposes `GET /healthz`, `GET/POST /v1/sessions`, and a JSON-over-TCP stream listener.
+4. `binboi http 3000` connects to the stream listener, sends a `register` message, and receives a `registered` response with tunnel metadata.
+5. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
+6. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
 
 ## Why The Implementation Is Intentionally Small
 
@@ -56,6 +57,7 @@ The tunnel and proxy layers therefore expose realistic integration points withou
 - proxy transport adapters
 - metrics and tracing
 - richer client ergonomics
+- request/response forwarding on top of the established register and heartbeat channel
 
 ## Design Principles
 

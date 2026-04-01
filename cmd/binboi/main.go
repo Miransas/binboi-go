@@ -8,10 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sardorazimov/binboi-go/internal/config"
+	"github.com/sardorazimov/binboi-go/internal/observability"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 	"github.com/sardorazimov/binboi-go/pkg/client"
 )
@@ -38,6 +43,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	case "version":
 		fmt.Fprintf(stdout, "binboi %s (%s)\n", version, commit)
 		return nil
+	case "http", "https", "tcp":
+		return runTunnelCommand(args[0], args[1:], stdout)
 	case "config":
 		return runConfig(args[1:], stdout)
 	case "health":
@@ -58,11 +65,71 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  binboi version")
+	fmt.Fprintln(w, "  binboi http 3000")
+	fmt.Fprintln(w, "  binboi tcp 5432 -server 127.0.0.1:8081")
 	fmt.Fprintln(w, "  binboi config init -path ./binboid.json")
 	fmt.Fprintln(w, "  binboi config print-sample")
 	fmt.Fprintln(w, "  binboi health -server http://127.0.0.1:8080")
 	fmt.Fprintln(w, "  binboi session create -name local-http -target http://127.0.0.1:3000")
 	fmt.Fprintln(w, "  binboi session list")
+}
+
+func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("%s requires a local port", protocol)
+	}
+
+	localPort, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("parse local port: %w", err)
+	}
+
+	fs := flag.NewFlagSet(protocol, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverAddr := fs.String("server", "127.0.0.1:8081", "daemon stream control address")
+	token := fs.String("token", "", "optional auth token")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	logger, err := observability.NewLogger("info", "text")
+	if err != nil {
+		return err
+	}
+
+	tunnelClient, err := client.NewTunnel(*serverAddr, logger)
+	if err != nil {
+		return err
+	}
+
+	hostname, _ := os.Hostname()
+
+	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	connectCtx, cancel := context.WithTimeout(signalCtx, 10*time.Second)
+	defer cancel()
+
+	session, err := tunnelClient.Connect(connectCtx, api.RegisterPayload{
+		Protocol:  protocol,
+		LocalPort: localPort,
+		AuthToken: *token,
+		Metadata: api.ClientMetadata{
+			ClientVersion: version,
+			Hostname:      hostname,
+			OS:            runtime.GOOS,
+			Arch:          runtime.GOARCH,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := writeJSON(stdout, session.Registered()); err != nil {
+		return err
+	}
+
+	return session.Run(signalCtx)
 }
 
 func runConfig(args []string, stdout io.Writer) error {

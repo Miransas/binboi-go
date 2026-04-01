@@ -4,7 +4,9 @@
     "environment": "docker-local"
   },
   "control": {
-    "listen_address": ":8080"
+    "listen_address": ":8080",
+    "protocol_address": ":8081",
+    "heartbeat_interval_seconds": 10
   },
   "tunnel": {
     "public_host": "docker.binboi.local",

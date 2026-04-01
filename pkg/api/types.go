@@ -22,14 +22,16 @@ type ListSessionsResponse struct {
 
 // Session describes a Binboi session managed by the daemon.
 type Session struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Protocol  string    `json:"protocol"`
-	Target    string    `json:"target"`
-	PublicURL string    `json:"public_url"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	Route     Route     `json:"route"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Protocol      string     `json:"protocol"`
+	Target        string     `json:"target"`
+	LocalPort     int        `json:"local_port,omitempty"`
+	PublicURL     string     `json:"public_url"`
+	Status        string     `json:"status"`
+	CreatedAt     time.Time  `json:"created_at"`
+	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	Route         Route      `json:"route"`
 }
 
 // Route describes the upstream route selected for a session.

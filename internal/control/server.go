@@ -4,30 +4,40 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/sardorazimov/binboi-go/internal/session"
 	"github.com/sardorazimov/binboi-go/pkg/api"
 )
 
-// Server exposes the control-plane API for the Binboi daemon.
+// ServerConfig contains the daemon's HTTP and stream control-plane settings.
+type ServerConfig struct {
+	HTTPAddress       string
+	ProtocolAddress   string
+	HeartbeatInterval time.Duration
+	Name              string
+	Version           string
+}
+
+// Server exposes the daemon's HTTP API and stream control protocol.
 type Server struct {
-	logger     *slog.Logger
-	manager    *session.Manager
-	name       string
-	version    string
-	httpServer *http.Server
+	logger         *slog.Logger
+	manager        *session.Manager
+	cfg            ServerConfig
+	httpServer     *http.Server
+	protocolServer *protocolServer
 }
 
 // NewServer constructs a new control-plane server.
-func NewServer(addr, name, version string, logger *slog.Logger, manager *session.Manager) *Server {
+func NewServer(cfg ServerConfig, logger *slog.Logger, manager *session.Manager) *Server {
 	server := &Server{
 		logger:  logger,
 		manager: manager,
-		name:    name,
-		version: version,
+		cfg:     cfg,
 	}
 
 	mux := http.NewServeMux()
@@ -35,10 +45,11 @@ func NewServer(addr, name, version string, logger *slog.Logger, manager *session
 	mux.HandleFunc("/v1/sessions", server.handleSessions)
 
 	server.httpServer = &http.Server{
-		Addr:              addr,
+		Addr:              cfg.HTTPAddress,
 		Handler:           loggingMiddleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, logger, manager)
 
 	return server
 }
@@ -48,8 +59,54 @@ func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
 }
 
-// Run starts the server and shuts it down when the context is cancelled.
+// Run starts both control-plane listeners and shuts them down when the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.runHTTP(ctx); err != nil {
+			errCh <- fmt.Errorf("http control server: %w", err)
+			cancel()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := s.protocolServer.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("stream control server: %w", err)
+			cancel()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case err := <-errCh:
+		<-done
+		return err
+	}
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (s *Server) runHTTP(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 
@@ -76,9 +133,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, api.HealthResponse{
-		Name:    s.name,
+		Name:    s.cfg.Name,
 		Status:  "ok",
-		Version: s.version,
+		Version: s.cfg.Version,
 		Time:    time.Now().UTC(),
 	})
 }

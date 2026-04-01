@@ -2,12 +2,17 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sardorazimov/binboi-go/internal/session"
+	"github.com/sardorazimov/binboi-go/pkg/api"
 	"github.com/sardorazimov/binboi-go/pkg/client"
 )
 
@@ -16,29 +21,130 @@ func TestServerSessionLifecycle(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
-	server := NewServer(":0", "binboid", "test", logger, manager)
+	server := NewServer(ServerConfig{
+		HTTPAddress:       ":0",
+		ProtocolAddress:   "127.0.0.1:0",
+		HeartbeatInterval: time.Second,
+		Name:              "binboid",
+		Version:           "test",
+	}, logger, manager)
 
-	ts := httptest.NewServer(server.Handler())
-	defer ts.Close()
+	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthResp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(healthResp, healthReq)
 
-	cli, err := client.New(ts.URL)
-	if err != nil {
-		t.Fatalf("create client: %v", err)
+	if healthResp.Code != http.StatusOK {
+		t.Fatalf("health status code mismatch: got %d want %d", healthResp.Code, http.StatusOK)
 	}
 
-	health, err := cli.Health(context.Background())
-	if err != nil {
-		t.Fatalf("health request: %v", err)
+	var health api.HealthResponse
+	if err := json.NewDecoder(healthResp.Body).Decode(&health); err != nil {
+		t.Fatalf("decode health response: %v", err)
 	}
 	if health.Status != "ok" {
 		t.Fatalf("health status mismatch: got %q want ok", health.Status)
 	}
 
-	session, err := cli.CreateSession(context.Background(), client.CreateSessionInput("demo", "http://127.0.0.1:3000"))
-	if err != nil {
-		t.Fatalf("create session: %v", err)
+	body := `{"name":"demo","target":"http://127.0.0.1:3000"}`
+	sessionReq := httptest.NewRequest(http.MethodPost, "/v1/sessions", strings.NewReader(body))
+	sessionReq.Header.Set("Content-Type", "application/json")
+	sessionResp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(sessionResp, sessionReq)
+
+	if sessionResp.Code != http.StatusCreated {
+		t.Fatalf("session status code mismatch: got %d want %d", sessionResp.Code, http.StatusCreated)
 	}
-	if session.ID == "" {
+
+	var created api.CreateSessionResponse
+	if err := json.NewDecoder(sessionResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create session response: %v", err)
+	}
+	if created.Session.ID == "" {
 		t.Fatal("expected session ID")
 	}
+}
+
+func TestProtocolRegisterAndHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+	stream := newProtocolServer("127.0.0.1:0", time.Second, logger, manager)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- stream.Run(ctx)
+	}()
+
+	address := waitForAddress(t, stream)
+
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: 3000,
+		Metadata: api.ClientMetadata{
+			ClientVersion: "test",
+			Hostname:      "unit-test",
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect tunnel client: %v", err)
+	}
+
+	runCtx, stop := context.WithTimeout(context.Background(), 2200*time.Millisecond)
+	defer stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	<-runCtx.Done()
+
+	if err := <-runDone; err != nil {
+		t.Fatalf("run tunnel session: %v", err)
+	}
+
+	waitForNoSessions(t, manager)
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
+func waitForAddress(t *testing.T, stream *protocolServer) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if address := stream.Address(); address != "" {
+			return address
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("protocol server did not publish an address")
+	return ""
+}
+
+func waitForNoSessions(t *testing.T, manager *session.Manager) {
+	t.Helper()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(manager.List(context.Background())) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("expected active sessions to be removed after disconnect, got %d", len(manager.List(context.Background())))
 }

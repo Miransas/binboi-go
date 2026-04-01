@@ -23,9 +23,11 @@ type ServiceConfig struct {
 	Environment string `json:"environment"`
 }
 
-// ControlConfig configures the daemon's HTTP control plane.
+// ControlConfig configures the daemon's HTTP and stream control-plane listeners.
 type ControlConfig struct {
-	ListenAddress string `json:"listen_address"`
+	ListenAddress            string `json:"listen_address"`
+	ProtocolAddress          string `json:"protocol_address"`
+	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
 }
 
 // TunnelConfig holds public tunnel-facing defaults.
@@ -53,7 +55,9 @@ func Default() Config {
 			Environment: "development",
 		},
 		Control: ControlConfig{
-			ListenAddress: ":8080",
+			ListenAddress:            ":8080",
+			ProtocolAddress:          ":8081",
+			HeartbeatIntervalSeconds: 10,
 		},
 		Tunnel: TunnelConfig{
 			PublicHost:      "local.binboi.test",
@@ -130,6 +134,12 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Control.ListenAddress == "" {
 		return errors.New("control.listen_address is required")
+	}
+	if cfg.Control.ProtocolAddress == "" {
+		return errors.New("control.protocol_address is required")
+	}
+	if cfg.Control.HeartbeatIntervalSeconds <= 0 {
+		return errors.New("control.heartbeat_interval_seconds must be greater than zero")
 	}
 	if cfg.Tunnel.PublicHost == "" {
 		return errors.New("tunnel.public_host is required")

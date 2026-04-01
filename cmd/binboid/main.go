@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/sardorazimov/binboi-go/internal/config"
 	"github.com/sardorazimov/binboi-go/internal/control"
@@ -46,7 +47,13 @@ func run() error {
 	}
 
 	manager := session.NewManager(cfg.Tunnel.PublicHost, cfg.Proxy.ForwardedHeader)
-	server := control.NewServer(cfg.Control.ListenAddress, cfg.Service.Name, version, logger, manager)
+	server := control.NewServer(control.ServerConfig{
+		HTTPAddress:       cfg.Control.ListenAddress,
+		ProtocolAddress:   cfg.Control.ProtocolAddress,
+		HeartbeatInterval: time.Duration(cfg.Control.HeartbeatIntervalSeconds) * time.Second,
+		Name:              cfg.Service.Name,
+		Version:           version,
+	}, logger, manager)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -54,7 +61,9 @@ func run() error {
 	logger.Info("starting binboid",
 		"version", version,
 		"commit", commit,
-		"addr", cfg.Control.ListenAddress,
+		"http_addr", cfg.Control.ListenAddress,
+		"protocol_addr", cfg.Control.ProtocolAddress,
+		"heartbeat_interval", time.Duration(cfg.Control.HeartbeatIntervalSeconds)*time.Second,
 		"public_host", cfg.Tunnel.PublicHost,
 		"environment", cfg.Service.Environment,
 	)

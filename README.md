@@ -27,6 +27,7 @@ go run ./cmd/binboid
 ```
 
 The daemon starts a lightweight control API on `:8080` by default.
+The daemon also starts a JSON-over-TCP stream control listener on `:8081` by default.
 
 ### 2. Check health
 
@@ -34,13 +35,13 @@ The daemon starts a lightweight control API on `:8080` by default.
 go run ./cmd/binboi health
 ```
 
-### 3. Create a sample session
+### 3. Start a live tunnel control session
 
 ```bash
-go run ./cmd/binboi session create \
-  -name local-http \
-  -target http://127.0.0.1:3000
+go run ./cmd/binboi http 3000
 ```
+
+That command connects to the daemon, sends a `register` message, receives tunnel metadata, and keeps the control connection alive with heartbeat `ping`/`pong` messages.
 
 ### 4. Generate a config file
 
@@ -68,14 +69,15 @@ The private Binboi product repository can depend on this engine, embed it, wrap 
 
 ## Development Notes
 
-- The current scaffold implements a working control API, config loader, logger setup, CLI commands, and in-memory session management.
-- Tunnel, transport, and proxy packages are intentionally lightweight so they can evolve without pretending to already be feature-complete.
+- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, and in-memory session tracking.
+- Tunnel forwarding is still intentionally deferred. The current protocol layer focuses on registration, tunnel metadata, and heartbeats.
 - The codebase favors standard library dependencies to keep the engine portable and easy to audit.
 - Folder-level README files are included to make each major area understandable on first read.
 
 ## Current Commands
 
 - `binboi version`
+- `binboi http 3000`
 - `binboi health`
 - `binboi config init`
 - `binboi config print-sample`
