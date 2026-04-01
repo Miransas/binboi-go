@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/sardorazimov/binboi-go/pkg/api"
 )
 
 // Config describes the daemon's runtime settings.
@@ -25,9 +27,10 @@ type ServiceConfig struct {
 
 // ControlConfig configures the daemon's HTTP and stream control-plane listeners.
 type ControlConfig struct {
-	ListenAddress            string `json:"listen_address"`
-	ProtocolAddress          string `json:"protocol_address"`
-	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
+	ListenAddress            string          `json:"listen_address"`
+	ProtocolAddress          string          `json:"protocol_address"`
+	HeartbeatIntervalSeconds int             `json:"heartbeat_interval_seconds"`
+	FlowControl              api.FlowControl `json:"flow_control"`
 }
 
 // TunnelConfig holds public tunnel-facing defaults.
@@ -58,6 +61,7 @@ func Default() Config {
 			ListenAddress:            ":8080",
 			ProtocolAddress:          ":8081",
 			HeartbeatIntervalSeconds: 10,
+			FlowControl:              api.FlowControl{}.Normalize(),
 		},
 		Tunnel: TunnelConfig{
 			PublicHost:      "local.binboi.test",
@@ -140,6 +144,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Control.HeartbeatIntervalSeconds <= 0 {
 		return errors.New("control.heartbeat_interval_seconds must be greater than zero")
+	}
+	if err := cfg.Control.FlowControl.Validate(); err != nil {
+		return fmt.Errorf("control.flow_control: %w", err)
 	}
 	if cfg.Tunnel.PublicHost == "" {
 		return errors.New("tunnel.public_host is required")

@@ -20,6 +20,7 @@ type ServerConfig struct {
 	HTTPAddress       string
 	ProtocolAddress   string
 	HeartbeatInterval time.Duration
+	FlowControl       api.FlowControl
 	Name              string
 	Version           string
 }
@@ -51,7 +52,7 @@ func NewServer(cfg ServerConfig, logger *slog.Logger, manager *session.Manager) 
 		Handler:           loggingMiddleware(logger, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, logger, manager)
+	server.protocolServer = newProtocolServer(cfg.ProtocolAddress, cfg.HeartbeatInterval, cfg.FlowControl.Normalize(), logger, manager)
 
 	return server
 }
@@ -191,8 +192,10 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "tunnel is currently disconnected")
 		case errors.Is(err, errTunnelUnsupported):
 			writeError(w, http.StatusNotImplemented, "tunnel protocol does not support HTTP forwarding yet")
-		case errors.Is(err, context.DeadlineExceeded):
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errStreamTimedOut):
 			writeError(w, http.StatusGatewayTimeout, "tunnel request timed out")
+		case errors.Is(err, errStreamIdleTimeout):
+			writeError(w, http.StatusGatewayTimeout, "tunnel stream went idle")
 		case errors.Is(err, context.Canceled):
 			writeError(w, http.StatusGatewayTimeout, "client closed request")
 		default:
@@ -207,13 +210,15 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	start, err := pending.waitForResponseStart(r.Context())
+	start, err := pending.waitForResponseStart()
 	if err != nil {
 		switch {
 		case errors.Is(err, errTunnelUnavailable):
 			writeError(w, http.StatusServiceUnavailable, "tunnel disconnected before response_start")
-		case errors.Is(err, context.DeadlineExceeded):
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errStreamTimedOut):
 			writeError(w, http.StatusGatewayTimeout, "tunnel response timed out")
+		case errors.Is(err, errStreamIdleTimeout):
+			writeError(w, http.StatusGatewayTimeout, "tunnel response went idle")
 		case errors.Is(err, context.Canceled):
 			writeError(w, http.StatusGatewayTimeout, "client closed request")
 		default:
@@ -229,22 +234,28 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(start.Status)
 
-	if _, err := io.Copy(w, pending.bodyReader); err != nil && !errors.Is(err, context.Canceled) {
-		s.logger.Warn("response body stream copy failed",
-			"host", host,
-			"method", r.Method,
-			"path", r.URL.RequestURI(),
-			"error", err,
-		)
+	if _, err := io.Copy(w, pending.bodyReader); err != nil {
+		pending.cancel("downstream response writer failed", err)
+		pending.peer.removePending(pending.id)
+		if !errors.Is(err, context.Canceled) {
+			s.logger.Warn("response body stream copy failed",
+				"host", host,
+				"method", r.Method,
+				"path", r.URL.RequestURI(),
+				"error", err,
+			)
+		}
 	}
 
-	if err := pending.waitForDone(r.Context()); err != nil && !errors.Is(err, context.Canceled) {
-		s.logger.Warn("response stream completed with error",
-			"host", host,
-			"method", r.Method,
-			"path", r.URL.RequestURI(),
-			"error", err,
-		)
+	if err := pending.waitForDone(); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			s.logger.Warn("response stream completed with error",
+				"host", host,
+				"method", r.Method,
+				"path", r.URL.RequestURI(),
+				"error", err,
+			)
+		}
 	}
 
 	s.logger.Info("sending tunneled response",

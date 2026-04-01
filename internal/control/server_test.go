@@ -76,7 +76,7 @@ func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
-	stream := newProtocolServer("127.0.0.1:0", time.Second, logger, manager)
+	stream := newProtocolServer("127.0.0.1:0", time.Second, api.FlowControl{}.Normalize(), logger, manager)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -433,6 +433,197 @@ func TestRequestCancellationPropagatesToUpstream(t *testing.T) {
 	recorder := <-respCh
 	if recorder.Code != http.StatusGatewayTimeout {
 		t.Fatalf("expected canceled request to return 504, got %d", recorder.Code)
+	}
+
+	waitForInFlight(t, manager, tunnelSession.Registered().TunnelID, 0)
+
+	stop()
+	_ = <-runDone
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
+func TestFlowControlQueuesWhenStreamLimitIsReached(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+	server := NewServer(ServerConfig{
+		HTTPAddress:       ":0",
+		ProtocolAddress:   "127.0.0.1:0",
+		HeartbeatInterval: time.Second,
+		FlowControl: api.FlowControl{
+			MaxConcurrentStreams:     1,
+			BufferedBytesPerStream:   api.DefaultBodyChunkSize,
+			StreamTimeoutSeconds:     10,
+			StreamIdleTimeoutSeconds: 2,
+		},
+		Name:    "binboid",
+		Version: "test",
+	}, logger, manager)
+
+	upstreamURL, shutdownUpstream := startUpstreamHTTPServer(t, 175*time.Millisecond)
+	defer shutdownUpstream()
+
+	localURL, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+
+	localPort, err := portFromHost(localURL.Host)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.protocolServer.Run(ctx)
+	}()
+
+	address := waitForAddress(t, server.protocolServer)
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: localPort,
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err != nil {
+		t.Fatalf("connect tunnel client: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	publicHost := hostNameFromPublicURL(tunnelSession.Registered().PublicURL)
+	startedAt := time.Now()
+
+	var wg sync.WaitGroup
+	recorders := make([]*httptest.ResponseRecorder, 2)
+	for i := range recorders {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			req := httptest.NewRequest(http.MethodGet, "http://"+publicHost+"/queued-"+strconv.Itoa(i), nil)
+			req.Host = publicHost
+
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, req)
+			recorders[i] = recorder
+		}()
+	}
+
+	wg.Wait()
+
+	if elapsed := time.Since(startedAt); elapsed < 300*time.Millisecond {
+		t.Fatalf("expected queued requests to take at least 300ms with one active stream, got %v", elapsed)
+	}
+
+	for i, recorder := range recorders {
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("response status mismatch for request %d: got %d want %d", i, recorder.Code, http.StatusCreated)
+		}
+	}
+
+	waitForInFlight(t, manager, tunnelSession.Registered().TunnelID, 0)
+
+	stop()
+	_ = <-runDone
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
+func TestIdleTimeoutReturnsGatewayTimeout(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+	server := NewServer(ServerConfig{
+		HTTPAddress:       ":0",
+		ProtocolAddress:   "127.0.0.1:0",
+		HeartbeatInterval: time.Second,
+		FlowControl: api.FlowControl{
+			MaxConcurrentStreams:     4,
+			BufferedBytesPerStream:   api.DefaultBodyChunkSize,
+			StreamTimeoutSeconds:     5,
+			StreamIdleTimeoutSeconds: 1,
+		},
+		Name:    "binboid",
+		Version: "test",
+	}, logger, manager)
+
+	upstreamURL, shutdownUpstream := startUpstreamHTTPServer(t, 2*time.Second)
+	defer shutdownUpstream()
+
+	localURL, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+
+	localPort, err := portFromHost(localURL.Host)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.protocolServer.Run(ctx)
+	}()
+
+	address := waitForAddress(t, server.protocolServer)
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: localPort,
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err != nil {
+		t.Fatalf("connect tunnel client: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	publicHost := hostNameFromPublicURL(tunnelSession.Registered().PublicURL)
+	req := httptest.NewRequest(http.MethodGet, "http://"+publicHost+"/idle", nil)
+	req.Host = publicHost
+
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected idle timeout to return 504, got %d", recorder.Code)
 	}
 
 	waitForInFlight(t, manager, tunnelSession.Registered().TunnelID, 0)

@@ -26,6 +26,14 @@ const (
 	MessageTypeClose         MessageType = "close"
 )
 
+const (
+	DefaultBodyChunkSize            = 32 * 1024
+	DefaultMaxConcurrentStreams     = 100
+	DefaultBufferedBytesPerStream   = 128 * 1024
+	DefaultStreamTimeoutSeconds     = 60
+	DefaultStreamIdleTimeoutSeconds = 15
+)
+
 // Message is the generic JSON envelope exchanged over the stream control plane.
 type Message struct {
 	Type    MessageType      `json:"type"`
@@ -51,17 +59,26 @@ type ClientMetadata struct {
 	Arch          string `json:"arch,omitempty"`
 }
 
+// FlowControl describes basic stream concurrency and buffering limits.
+type FlowControl struct {
+	MaxConcurrentStreams     int `json:"max_concurrent_streams,omitempty"`
+	BufferedBytesPerStream   int `json:"buffered_bytes_per_stream,omitempty"`
+	StreamTimeoutSeconds     int `json:"stream_timeout_seconds,omitempty"`
+	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds,omitempty"`
+}
+
 // RegisteredPayload confirms that the daemon accepted a tunnel session.
 type RegisteredPayload struct {
-	TunnelID                 string `json:"tunnel_id"`
-	Protocol                 string `json:"protocol"`
-	LocalPort                int    `json:"local_port"`
-	Target                   string `json:"target"`
-	PublicURL                string `json:"public_url"`
-	Status                   string `json:"status"`
-	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
-	ResumeToken              string `json:"resume_token,omitempty"`
-	Resumed                  bool   `json:"resumed,omitempty"`
+	TunnelID                 string      `json:"tunnel_id"`
+	Protocol                 string      `json:"protocol"`
+	LocalPort                int         `json:"local_port"`
+	Target                   string      `json:"target"`
+	PublicURL                string      `json:"public_url"`
+	Status                   string      `json:"status"`
+	HeartbeatIntervalSeconds int         `json:"heartbeat_interval_seconds"`
+	ResumeToken              string      `json:"resume_token,omitempty"`
+	Resumed                  bool        `json:"resumed,omitempty"`
+	FlowControl              FlowControl `json:"flow_control,omitempty"`
 }
 
 // PingPayload keeps a control connection alive.
@@ -75,8 +92,6 @@ type PongPayload struct {
 	Sequence   int64     `json:"sequence"`
 	ReceivedAt time.Time `json:"received_at"`
 }
-
-const DefaultBodyChunkSize = 32 * 1024
 
 // RequestStartPayload describes an incoming HTTP request before body frames arrive.
 type RequestStartPayload struct {
@@ -167,4 +182,62 @@ func NormalizeTunnelProtocol(protocol string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported protocol %q", protocol)
 	}
+}
+
+// Normalize applies production-minded defaults to flow-control settings.
+func (f FlowControl) Normalize() FlowControl {
+	if f.MaxConcurrentStreams <= 0 {
+		f.MaxConcurrentStreams = DefaultMaxConcurrentStreams
+	}
+	if f.BufferedBytesPerStream <= 0 {
+		f.BufferedBytesPerStream = DefaultBufferedBytesPerStream
+	}
+	if f.StreamTimeoutSeconds <= 0 {
+		f.StreamTimeoutSeconds = DefaultStreamTimeoutSeconds
+	}
+	if f.StreamIdleTimeoutSeconds <= 0 {
+		f.StreamIdleTimeoutSeconds = DefaultStreamIdleTimeoutSeconds
+	}
+	return f
+}
+
+// Validate ensures the flow-control configuration is usable.
+func (f FlowControl) Validate() error {
+	normalized := f.Normalize()
+	if normalized.MaxConcurrentStreams <= 0 {
+		return fmt.Errorf("max_concurrent_streams must be greater than zero")
+	}
+	if normalized.BufferedBytesPerStream < DefaultBodyChunkSize {
+		return fmt.Errorf("buffered_bytes_per_stream must be at least %d", DefaultBodyChunkSize)
+	}
+	if normalized.StreamTimeoutSeconds <= 0 {
+		return fmt.Errorf("stream_timeout_seconds must be greater than zero")
+	}
+	if normalized.StreamIdleTimeoutSeconds <= 0 {
+		return fmt.Errorf("stream_idle_timeout_seconds must be greater than zero")
+	}
+	return nil
+}
+
+// BufferedFrameCapacity returns the number of chunk-sized frames allowed in memory per stream.
+func (f FlowControl) BufferedFrameCapacity() int {
+	normalized := f.Normalize()
+	capacity := normalized.BufferedBytesPerStream / DefaultBodyChunkSize
+	if normalized.BufferedBytesPerStream%DefaultBodyChunkSize != 0 {
+		capacity++
+	}
+	if capacity < 1 {
+		return 1
+	}
+	return capacity
+}
+
+// StreamTimeout returns the maximum lifetime for a single request stream.
+func (f FlowControl) StreamTimeout() time.Duration {
+	return time.Duration(f.Normalize().StreamTimeoutSeconds) * time.Second
+}
+
+// StreamIdleTimeout returns the maximum allowed idle period for a stream.
+func (f FlowControl) StreamIdleTimeout() time.Duration {
+	return time.Duration(f.Normalize().StreamIdleTimeoutSeconds) * time.Second
 }

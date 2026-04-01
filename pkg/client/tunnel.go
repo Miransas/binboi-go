@@ -49,10 +49,11 @@ type TunnelSession struct {
 	codec             *api.MessageCodec
 	logger            *slog.Logger
 	registered        api.RegisteredPayload
+	flowControl       api.FlowControl
 	heartbeatInterval time.Duration
 	httpClient        *http.Client
 	closeConn         func()
-	sendMu            sync.Mutex
+	dispatcher        *api.MessageDispatcher
 	activeMu          sync.Mutex
 	active            map[string]*activeRequest
 }
@@ -142,20 +143,34 @@ func (c *TunnelClient) Connect(ctx context.Context, payload api.RegisterPayload)
 			"public_url", registered.PublicURL,
 			"heartbeat_interval", heartbeatInterval,
 			"resumed", registered.Resumed,
+			"max_concurrent_streams", registered.FlowControl.Normalize().MaxConcurrentStreams,
+			"buffered_bytes_per_stream", registered.FlowControl.Normalize().BufferedBytesPerStream,
 		)
 
-		return &TunnelSession{
+		session := &TunnelSession{
 			conn:              conn,
 			codec:             codec,
 			logger:            c.logger,
 			registered:        registered,
+			flowControl:       registered.FlowControl.Normalize(),
 			heartbeatInterval: heartbeatInterval,
 			httpClient: &http.Client{
-				Timeout: 30 * time.Second,
+				Timeout: registered.FlowControl.Normalize().StreamTimeout(),
 			},
 			closeConn: closeConn,
 			active:    make(map[string]*activeRequest),
-		}, nil
+		}
+		session.dispatcher = api.NewMessageDispatcher(session.rawSend, api.DispatcherConfig{
+			StreamQueueCapacity: session.flowControl.BufferedFrameCapacity(),
+		}, func(err error) {
+			session.logger.Warn("client message dispatcher stopped",
+				"tunnel_id", session.registered.TunnelID,
+				"error", err,
+			)
+			session.closeConn()
+		})
+
+		return session, nil
 	case api.MessageTypeError:
 		var protocolErr api.ProtocolErrorPayload
 		if err := message.Decode(&protocolErr); err != nil {
@@ -267,13 +282,14 @@ func (s *TunnelSession) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer s.closeConn()
+	defer s.dispatcher.Close(api.ErrDispatcherClosed)
 	defer s.cancelActiveRequests(context.Canceled)
 
 	heartbeatErrCh := make(chan error, 1)
 
 	go func() {
 		<-ctx.Done()
-		_ = s.send(api.MessageTypeClose, api.ClosePayload{Reason: "client shutdown"})
+		_ = s.send(ctx, api.MessageTypeClose, api.ClosePayload{Reason: "client shutdown"})
 		s.closeConn()
 	}()
 
@@ -385,14 +401,29 @@ func (s *TunnelSession) Run(ctx context.Context) error {
 	}
 }
 
-func (s *TunnelSession) sendMessage(message api.Message) error {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-
+func (s *TunnelSession) rawSend(message api.Message) error {
 	if err := s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return err
 	}
 	return s.codec.Send(message)
+}
+
+func (s *TunnelSession) sendControl(ctx context.Context, message api.Message) error {
+	return s.dispatcher.EnqueueControl(ctx, message)
+}
+
+func (s *TunnelSession) sendStream(ctx context.Context, requestID string, message api.Message, final bool) error {
+	start := time.Now()
+	err := s.dispatcher.EnqueueStream(ctx, requestID, message, final)
+	if waited := time.Since(start); waited > 25*time.Millisecond {
+		s.logger.Warn("client stream backpressure engaged",
+			"tunnel_id", s.registered.TunnelID,
+			"request_id", requestID,
+			"message_type", message.Type,
+			"wait", waited,
+		)
+	}
+	return err
 }
 
 func (s *TunnelSession) heartbeatLoop(ctx context.Context) error {
@@ -414,7 +445,7 @@ func (s *TunnelSession) heartbeatLoop(ctx context.Context) error {
 				Sequence: sequence,
 				SentAt:   time.Now().UTC(),
 			}
-			if err := s.send(api.MessageTypePing, payload); err != nil {
+			if err := s.send(ctx, api.MessageTypePing, payload); err != nil {
 				s.closeConn()
 				return fmt.Errorf("send heartbeat ping: %w", err)
 			}

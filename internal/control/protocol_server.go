@@ -20,6 +20,7 @@ const registerTimeout = 10 * time.Second
 type protocolServer struct {
 	address           string
 	heartbeatInterval time.Duration
+	flowControl       api.FlowControl
 	logger            *slog.Logger
 	manager           *session.Manager
 
@@ -28,10 +29,11 @@ type protocolServer struct {
 	peers    map[string]*protocolPeer
 }
 
-func newProtocolServer(address string, heartbeatInterval time.Duration, logger *slog.Logger, manager *session.Manager) *protocolServer {
+func newProtocolServer(address string, heartbeatInterval time.Duration, flowControl api.FlowControl, logger *slog.Logger, manager *session.Manager) *protocolServer {
 	return &protocolServer{
 		address:           address,
 		heartbeatInterval: heartbeatInterval,
+		flowControl:       flowControl.Normalize(),
 		logger:            logger,
 		manager:           manager,
 		peers:             make(map[string]*protocolPeer),
@@ -127,6 +129,9 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 
 	defer func() {
 		if sessionID != "" {
+			if peer != nil {
+				peer.close()
+			}
 			s.removePeer(sessionID, peer)
 			s.manager.DetachConnection(sessionID, time.Now().UTC())
 			if peer != nil {
@@ -196,7 +201,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 	registeredSession := registerResult.Session
 	sessionID = registeredSession.ID
 	localPort = register.LocalPort
-	peer = newProtocolPeer(registeredSession, conn, codec, s.logger, s.manager)
+	peer = newProtocolPeer(registeredSession, conn, codec, s.logger, s.manager, s.flowControl)
 	s.addPeer(peer)
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
@@ -215,12 +220,13 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		HeartbeatIntervalSeconds: int(s.heartbeatInterval / time.Second),
 		ResumeToken:              resumeToken,
 		Resumed:                  registerResult.Resumed,
+		FlowControl:              s.flowControl,
 	})
 	if err != nil {
 		s.logger.Warn("failed to encode registered response", "tunnel_id", sessionID, "error", err)
 		return
 	}
-	if err := peer.send(registeredMessage); err != nil {
+	if err := peer.sendControl(ctx, registeredMessage); err != nil {
 		s.logger.Warn("failed to send registered response", "tunnel_id", sessionID, "error", err)
 		return
 	}
@@ -269,11 +275,11 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		case api.MessageTypePing:
 			var ping api.PingPayload
 			if err := message.Decode(&ping); err != nil {
-				s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "malformed_payload", err.Error())
 				return
 			}
 			if err := s.manager.TouchHeartbeat(sessionID, time.Now().UTC()); err != nil {
-				s.sendProtocolError(conn, codec, message.ID, "unknown_session", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "unknown_session", err.Error())
 				return
 			}
 
@@ -286,18 +292,18 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 				return
 			}
 			pongMessage.ID = message.ID
-			if err := peer.send(pongMessage); err != nil {
+			if err := peer.sendControl(ctx, pongMessage); err != nil {
 				s.logger.Warn("failed to send pong", "tunnel_id", sessionID, "error", err)
 				return
 			}
 		case api.MessageTypeResponseStart:
 			var responseStart api.ResponseStartPayload
 			if err := message.Decode(&responseStart); err != nil {
-				s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "malformed_payload", err.Error())
 				continue
 			}
 			if message.ID == "" {
-				s.sendProtocolError(conn, codec, "", "malformed_payload", "response_start missing id")
+				_ = peer.sendProtocolError(ctx, "", "malformed_payload", "response_start missing id")
 				continue
 			}
 			if err := peer.handleResponseStart(message.ID, responseStart); err != nil {
@@ -306,7 +312,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 					"request_id", message.ID,
 					"error", err,
 				)
-				s.sendProtocolError(conn, codec, message.ID, "invalid_frame_order", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "invalid_frame_order", err.Error())
 				continue
 			}
 
@@ -318,11 +324,11 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		case api.MessageTypeResponseBody:
 			var body api.BodyChunkPayload
 			if err := message.Decode(&body); err != nil {
-				s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "malformed_payload", err.Error())
 				continue
 			}
 			if message.ID == "" {
-				s.sendProtocolError(conn, codec, "", "malformed_payload", "response_body missing id")
+				_ = peer.sendProtocolError(ctx, "", "malformed_payload", "response_body missing id")
 				continue
 			}
 			if err := peer.handleResponseBody(message.ID, body.Chunk); err != nil {
@@ -331,7 +337,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 					"request_id", message.ID,
 					"error", err,
 				)
-				s.sendProtocolError(conn, codec, message.ID, "invalid_frame_order", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "invalid_frame_order", err.Error())
 				continue
 			}
 			s.logger.Debug("received response_body chunk",
@@ -343,12 +349,12 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 			if message.Payload != nil {
 				var end api.StreamEndPayload
 				if err := message.Decode(&end); err != nil {
-					s.sendProtocolError(conn, codec, message.ID, "malformed_payload", err.Error())
+					_ = peer.sendProtocolError(ctx, message.ID, "malformed_payload", err.Error())
 					continue
 				}
 			}
 			if message.ID == "" {
-				s.sendProtocolError(conn, codec, "", "malformed_payload", "response_end missing id")
+				_ = peer.sendProtocolError(ctx, "", "malformed_payload", "response_end missing id")
 				continue
 			}
 			if err := peer.handleResponseEnd(message.ID); err != nil {
@@ -357,7 +363,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 					"request_id", message.ID,
 					"error", err,
 				)
-				s.sendProtocolError(conn, codec, message.ID, "invalid_frame_order", err.Error())
+				_ = peer.sendProtocolError(ctx, message.ID, "invalid_frame_order", err.Error())
 				continue
 			}
 			s.logger.Debug("received response_end",
@@ -400,7 +406,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 			)
 			return
 		default:
-			s.sendProtocolError(conn, codec, message.ID, "unsupported_message", fmt.Sprintf("message type %q is not supported yet", message.Type))
+			_ = peer.sendProtocolError(ctx, message.ID, "unsupported_message", fmt.Sprintf("message type %q is not supported yet", message.Type))
 			return
 		}
 	}

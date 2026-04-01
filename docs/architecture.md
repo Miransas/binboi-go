@@ -35,12 +35,13 @@ The current scaffold is intentionally modest: it implements a working control pl
 3. The control plane exposes `GET /healthz`, `GET/POST /v1/sessions`, and a JSON-over-TCP stream listener.
 4. `binboi http 3000` connects to the stream listener, sends a `register` message, and receives a `registered` response with tunnel metadata.
 5. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
-6. Incoming HTTP requests are converted into `request` protocol messages, forwarded to the connected client, proxied to the local service, and returned as `response` messages.
+6. Incoming HTTP requests are converted into framed `request_*` protocol messages, forwarded to the connected client, proxied to the local service, and returned as framed `response_*` messages.
 7. The server tracks multiple in-flight requests per tunnel by request ID while the client processes request messages concurrently.
-8. Request and response bodies are transported as framed streams using `*_start`, `*_body`, and `*_end` messages instead of whole buffered blobs.
-9. Cancellation is propagated with request-scoped cancel messages so user disconnects or timeouts can abort local upstream work.
-10. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
-11. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
+8. One fair outbound dispatcher per tunnel multiplexes stream frames in round-robin order so large bodies do not monopolize the connection.
+9. Flow control limits bound active streams and per-stream buffered chunks, which lets backpressure propagate naturally when either side slows down.
+10. Cancellation is propagated with request-scoped cancel messages so user disconnects, idle streams, or timeouts can abort local upstream work.
+11. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
+12. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
 
 ## Why The Implementation Is Intentionally Small
 
@@ -62,7 +63,7 @@ The tunnel and proxy layers therefore expose realistic integration points withou
 - proxy transport adapters
 - metrics and tracing
 - richer client ergonomics
-- smarter multiplex scheduling and flow control on top of the current framed stream transport
+- richer flow windows and weighted multiplex scheduling on top of the current framed stream transport
 - richer resume semantics such as expiry windows and request cancellation
 
 ## Design Principles

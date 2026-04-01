@@ -41,7 +41,7 @@ go run ./cmd/binboi health
 go run ./cmd/binboi http 3000
 ```
 
-That command connects to the daemon, sends a `register` message, receives tunnel metadata, keeps the control connection alive with heartbeat `ping`/`pong` messages, can proxy basic HTTP requests back to your local service, and now automatically retries with session resume when the control connection drops.
+That command connects to the daemon, sends a `register` message, receives tunnel metadata, keeps the control connection alive with heartbeat `ping`/`pong` messages, can proxy basic HTTP requests back to your local service, automatically retries with session resume when the control connection drops, and now applies bounded per-stream flow control for safer multiplexing.
 
 ### 4. Generate a config file
 
@@ -69,8 +69,9 @@ The private Binboi product repository can depend on this engine, embed it, wrap 
 
 ## Development Notes
 
-- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, and framed body streaming.
-- The forwarding layer is still intentionally modest: request and response bodies now move as framed chunks, but advanced flow control, websocket tunneling, and binary framing are still future work.
+- The current scaffold implements a working HTTP API, stream control protocol, config loader, logger setup, CLI commands, resumable in-memory session tracking, automatic reconnect, concurrent HTTP request forwarding, framed body streaming, and bounded flow control with fair per-stream scheduling.
+- The forwarding layer is still intentionally modest: request and response bodies move as framed chunks with backpressure and idle timeouts, but websocket tunneling, richer flow windows, and binary framing are still future work.
+- Daemon flow limits live under `control.flow_control` in the JSON config and control active streams, per-stream buffering, stream timeout, and idle timeout behavior.
 - The codebase favors standard library dependencies to keep the engine portable and easy to audit.
 - Folder-level README files are included to make each major area understandable on first read.
 

@@ -6,7 +6,13 @@
   "control": {
     "listen_address": ":8080",
     "protocol_address": ":8081",
-    "heartbeat_interval_seconds": 10
+    "heartbeat_interval_seconds": 10,
+    "flow_control": {
+      "max_concurrent_streams": 100,
+      "buffered_bytes_per_stream": 131072,
+      "stream_timeout_seconds": 60,
+      "stream_idle_timeout_seconds": 15
+    }
   },
   "tunnel": {
     "public_host": "docker.binboi.local",

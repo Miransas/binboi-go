@@ -51,6 +51,7 @@ func run() error {
 		HTTPAddress:       cfg.Control.ListenAddress,
 		ProtocolAddress:   cfg.Control.ProtocolAddress,
 		HeartbeatInterval: time.Duration(cfg.Control.HeartbeatIntervalSeconds) * time.Second,
+		FlowControl:       cfg.Control.FlowControl,
 		Name:              cfg.Service.Name,
 		Version:           version,
 	}, logger, manager)
@@ -64,6 +65,10 @@ func run() error {
 		"http_addr", cfg.Control.ListenAddress,
 		"protocol_addr", cfg.Control.ProtocolAddress,
 		"heartbeat_interval", time.Duration(cfg.Control.HeartbeatIntervalSeconds)*time.Second,
+		"max_concurrent_streams", cfg.Control.FlowControl.Normalize().MaxConcurrentStreams,
+		"buffered_bytes_per_stream", cfg.Control.FlowControl.Normalize().BufferedBytesPerStream,
+		"stream_timeout", cfg.Control.FlowControl.Normalize().StreamTimeout(),
+		"stream_idle_timeout", cfg.Control.FlowControl.Normalize().StreamIdleTimeout(),
 		"public_host", cfg.Tunnel.PublicHost,
 		"environment", cfg.Service.Environment,
 	)
