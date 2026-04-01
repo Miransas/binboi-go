@@ -107,10 +107,7 @@ func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
 	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	connectCtx, cancel := context.WithTimeout(signalCtx, 10*time.Second)
-	defer cancel()
-
-	session, err := tunnelClient.Connect(connectCtx, api.RegisterPayload{
+	registerPayload := api.RegisterPayload{
 		Protocol:  protocol,
 		LocalPort: localPort,
 		AuthToken: *token,
@@ -120,16 +117,16 @@ func runTunnelCommand(protocol string, args []string, stdout io.Writer) error {
 			OS:            runtime.GOOS,
 			Arch:          runtime.GOARCH,
 		},
+	}
+
+	printed := false
+	return tunnelClient.Run(signalCtx, registerPayload, func(registered api.RegisteredPayload) {
+		if printed {
+			return
+		}
+		_ = writeJSON(stdout, registered)
+		printed = true
 	})
-	if err != nil {
-		return err
-	}
-
-	if err := writeJSON(stdout, session.Registered()); err != nil {
-		return err
-	}
-
-	return session.Run(signalCtx)
 }
 
 func runConfig(args []string, stdout io.Writer) error {

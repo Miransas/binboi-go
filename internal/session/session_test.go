@@ -40,13 +40,17 @@ func TestManagerRegisterAndHeartbeat(t *testing.T) {
 	defer serverConn.Close()
 	defer clientConn.Close()
 
-	registered, err := manager.RegisterTunnel(context.Background(), RegisterRequest{
+	result, err := manager.RegisterTunnel(context.Background(), RegisterRequest{
 		Protocol:  "http",
 		LocalPort: 3000,
 		Conn:      serverConn,
 	})
 	if err != nil {
 		t.Fatalf("register tunnel: %v", err)
+	}
+	registered := result.Session
+	if result.Resumed {
+		t.Fatal("expected initial register, not resume")
 	}
 
 	if registered.LocalPort != 3000 {
@@ -67,5 +71,57 @@ func TestManagerRegisterAndHeartbeat(t *testing.T) {
 	}
 	if sessions[0].LastHeartbeat == nil || !sessions[0].LastHeartbeat.Equal(now) {
 		t.Fatal("expected last heartbeat to be updated")
+	}
+
+	manager.DetachConnection(registered.ID, now)
+	sessions = manager.List(context.Background())
+	if sessions[0].Connection != "disconnected" {
+		t.Fatalf("connection state mismatch: got %q want disconnected", sessions[0].Connection)
+	}
+}
+
+func TestManagerResumeTunnel(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager("local.binboi.test", "X-Binboi-Session")
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	initial, err := manager.RegisterTunnel(context.Background(), RegisterRequest{
+		Protocol:  "http",
+		LocalPort: 3000,
+		Conn:      serverConn,
+	})
+	if err != nil {
+		t.Fatalf("initial register: %v", err)
+	}
+
+	token, ok := manager.ResumeToken(initial.Session.ID)
+	if !ok {
+		t.Fatal("expected resume token")
+	}
+
+	manager.DetachConnection(initial.Session.ID, time.Now().UTC())
+
+	resumeServerConn, resumeClientConn := net.Pipe()
+	defer resumeServerConn.Close()
+	defer resumeClientConn.Close()
+
+	resumed, err := manager.RegisterTunnel(context.Background(), RegisterRequest{
+		Protocol:       "http",
+		LocalPort:      3000,
+		Conn:           resumeServerConn,
+		ResumeTunnelID: initial.Session.ID,
+		ResumeToken:    token,
+	})
+	if err != nil {
+		t.Fatalf("resume register: %v", err)
+	}
+	if !resumed.Resumed {
+		t.Fatal("expected resumed result")
+	}
+	if resumed.Session.ID != initial.Session.ID {
+		t.Fatalf("session ID mismatch: got %q want %q", resumed.Session.ID, initial.Session.ID)
 	}
 }

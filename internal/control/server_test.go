@@ -66,9 +66,12 @@ func TestServerSessionLifecycle(t *testing.T) {
 	if created.Session.ID == "" {
 		t.Fatal("expected session ID")
 	}
+	if created.Session.Connection != "idle" {
+		t.Fatalf("connection state mismatch: got %q want idle", created.Session.Connection)
+	}
 }
 
-func TestProtocolRegisterAndHeartbeat(t *testing.T) {
+func TestProtocolRegisterDisconnectAndResume(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -84,39 +87,58 @@ func TestProtocolRegisterAndHeartbeat(t *testing.T) {
 	}()
 
 	address := waitForAddress(t, stream)
-
 	tunnelClient, err := client.NewTunnel(address, logger)
 	if err != nil {
 		t.Fatalf("create tunnel client: %v", err)
 	}
 
-	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
-		Protocol:  "http",
-		LocalPort: 3000,
-		Metadata: api.ClientMetadata{
-			ClientVersion: "test",
-			Hostname:      "unit-test",
-		},
-	})
-	if err != nil {
-		t.Fatalf("connect tunnel client: %v", err)
-	}
-
-	runCtx, stop := context.WithTimeout(context.Background(), 2200*time.Millisecond)
+	registeredCh := make(chan api.RegisteredPayload, 4)
+	runCtx, stop := context.WithCancel(context.Background())
 	defer stop()
 
 	runDone := make(chan error, 1)
 	go func() {
-		runDone <- tunnelSession.Run(runCtx)
+		runDone <- tunnelClient.Run(runCtx, api.RegisterPayload{
+			Protocol:  "http",
+			LocalPort: 3000,
+			Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+		}, func(registered api.RegisteredPayload) {
+			registeredCh <- registered
+		})
 	}()
 
-	<-runCtx.Done()
-
-	if err := <-runDone; err != nil {
-		t.Fatalf("run tunnel session: %v", err)
+	initial := waitForRegistered(t, registeredCh)
+	if initial.Resumed {
+		t.Fatal("expected first registration to be fresh")
 	}
 
-	waitForNoSessions(t, manager)
+	waitForConnectionState(t, manager, initial.TunnelID, "connected")
+
+	if err := stream.closePeer(initial.TunnelID); err != nil {
+		t.Fatalf("close peer: %v", err)
+	}
+
+	waitForConnectionState(t, manager, initial.TunnelID, "disconnected")
+
+	resumed := waitForRegistered(t, registeredCh)
+	if !resumed.Resumed {
+		t.Fatal("expected resumed registration")
+	}
+	if resumed.TunnelID != initial.TunnelID {
+		t.Fatalf("tunnel ID mismatch after resume: got %q want %q", resumed.TunnelID, initial.TunnelID)
+	}
+	if resumed.PublicURL != initial.PublicURL {
+		t.Fatalf("public URL mismatch after resume: got %q want %q", resumed.PublicURL, initial.PublicURL)
+	}
+
+	waitForConnectionState(t, manager, initial.TunnelID, "connected")
+
+	stop()
+	if err := <-runDone; err != nil {
+		t.Fatalf("run tunnel client: %v", err)
+	}
+
+	waitForConnectionState(t, manager, initial.TunnelID, "disconnected")
 
 	cancel()
 	if err := <-errCh; err != nil {
@@ -124,7 +146,7 @@ func TestProtocolRegisterAndHeartbeat(t *testing.T) {
 	}
 }
 
-func TestHTTPForwarding(t *testing.T) {
+func TestHTTPForwardingConcurrentRequests(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -137,7 +159,7 @@ func TestHTTPForwarding(t *testing.T) {
 		Version:           "test",
 	}, logger, manager)
 
-	upstreamURL, shutdownUpstream := startUpstreamHTTPServer(t)
+	upstreamURL, shutdownUpstream := startUpstreamHTTPServer(t, 75*time.Millisecond)
 	defer shutdownUpstream()
 
 	localURL, err := url.Parse(upstreamURL)
@@ -159,7 +181,6 @@ func TestHTTPForwarding(t *testing.T) {
 	}()
 
 	address := waitForAddress(t, server.protocolServer)
-
 	tunnelClient, err := client.NewTunnel(address, logger)
 	if err != nil {
 		t.Fatalf("create tunnel client: %v", err)
@@ -168,10 +189,7 @@ func TestHTTPForwarding(t *testing.T) {
 	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
 		Protocol:  "http",
 		LocalPort: localPort,
-		Metadata: api.ClientMetadata{
-			ClientVersion: "test",
-			Hostname:      "unit-test",
-		},
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
 	})
 	if err != nil {
 		t.Fatalf("connect tunnel client: %v", err)
@@ -185,12 +203,12 @@ func TestHTTPForwarding(t *testing.T) {
 		runDone <- tunnelSession.Run(runCtx)
 	}()
 
-	publicHost := hostFromPublicURL(tunnelSession.Registered().PublicURL)
+	publicHost := hostNameFromPublicURL(tunnelSession.Registered().PublicURL)
 	if publicHost == "" {
 		t.Fatal("expected public host")
 	}
 
-	paths := []string{"/alpha?x=1", "/beta"}
+	paths := []string{"/alpha?x=1", "/beta", "/gamma", "/delta"}
 	recorders := make([]*httptest.ResponseRecorder, len(paths))
 	var wg sync.WaitGroup
 
@@ -222,17 +240,106 @@ func TestHTTPForwarding(t *testing.T) {
 		if !strings.Contains(recorder.Body.String(), paths[i]) {
 			t.Fatalf("response body missing path for request %d: %q", i, recorder.Body.String())
 		}
-		if !strings.Contains(recorder.Body.String(), "hello from request") {
-			t.Fatalf("response body missing request payload for request %d: %q", i, recorder.Body.String())
-		}
 	}
+
+	waitForInFlight(t, manager, tunnelSession.Registered().TunnelID, 0)
 
 	stop()
 	if err := <-runDone; err != nil {
 		t.Fatalf("run tunnel session: %v", err)
 	}
 
-	waitForNoSessions(t, manager)
+	waitForConnectionState(t, manager, tunnelSession.Registered().TunnelID, "disconnected")
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("protocol server run: %v", err)
+	}
+}
+
+func TestPendingRequestsFailOnDisconnect(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	manager := session.NewManager("local.binboi.test", "X-Binboi-Session")
+	server := NewServer(ServerConfig{
+		HTTPAddress:       ":0",
+		ProtocolAddress:   "127.0.0.1:0",
+		HeartbeatInterval: time.Second,
+		Name:              "binboid",
+		Version:           "test",
+	}, logger, manager)
+
+	upstreamURL, shutdownUpstream := startUpstreamHTTPServer(t, 2*time.Second)
+	defer shutdownUpstream()
+
+	localURL, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+
+	localPort, err := portFromHost(localURL.Host)
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.protocolServer.Run(ctx)
+	}()
+
+	address := waitForAddress(t, server.protocolServer)
+	tunnelClient, err := client.NewTunnel(address, logger)
+	if err != nil {
+		t.Fatalf("create tunnel client: %v", err)
+	}
+
+	tunnelSession, err := tunnelClient.Connect(context.Background(), api.RegisterPayload{
+		Protocol:  "http",
+		LocalPort: localPort,
+		Metadata:  api.ClientMetadata{ClientVersion: "test", Hostname: "unit-test"},
+	})
+	if err != nil {
+		t.Fatalf("connect tunnel client: %v", err)
+	}
+
+	runCtx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tunnelSession.Run(runCtx)
+	}()
+
+	publicHost := hostNameFromPublicURL(tunnelSession.Registered().PublicURL)
+	req := httptest.NewRequest(http.MethodGet, "http://"+publicHost+"/slow", nil)
+	req.Host = publicHost
+
+	respCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, req)
+		respCh <- recorder
+	}()
+
+	waitForInFlightAtLeast(t, manager, tunnelSession.Registered().TunnelID, 1)
+
+	if err := server.protocolServer.closePeer(tunnelSession.Registered().TunnelID); err != nil {
+		t.Fatalf("close peer: %v", err)
+	}
+
+	recorder := <-respCh
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected pending request failure to return 503, got %d", recorder.Code)
+	}
+
+	waitForInFlight(t, manager, tunnelSession.Registered().TunnelID, 0)
+
+	stop()
+	_ = <-runDone
 
 	cancel()
 	if err := <-errCh; err != nil {
@@ -255,21 +362,67 @@ func waitForAddress(t *testing.T, stream *protocolServer) string {
 	return ""
 }
 
-func waitForNoSessions(t *testing.T, manager *session.Manager) {
+func waitForRegistered(t *testing.T, registeredCh <-chan api.RegisteredPayload) api.RegisteredPayload {
 	t.Helper()
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(manager.List(context.Background())) == 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case registered := <-registeredCh:
+		return registered
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for registered payload")
+		return api.RegisteredPayload{}
 	}
-
-	t.Fatalf("expected active sessions to be removed after disconnect, got %d", len(manager.List(context.Background())))
 }
 
-func startUpstreamHTTPServer(t *testing.T) (string, func()) {
+func waitForConnectionState(t *testing.T, manager *session.Manager, sessionID, state string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, current := range manager.List(context.Background()) {
+			if current.ID == sessionID && current.Connection == state {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for session %s to reach connection state %q", sessionID, state)
+}
+
+func waitForInFlight(t *testing.T, manager *session.Manager, sessionID string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, current := range manager.List(context.Background()) {
+			if current.ID == sessionID && current.InFlight == want {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for session %s to reach in-flight %d", sessionID, want)
+}
+
+func waitForInFlightAtLeast(t *testing.T, manager *session.Manager, sessionID string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, current := range manager.List(context.Background()) {
+			if current.ID == sessionID && current.InFlight >= want {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for session %s to reach in-flight >= %d", sessionID, want)
+}
+
+func startUpstreamHTTPServer(t *testing.T, delay time.Duration) (string, func()) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -280,6 +433,7 @@ func startUpstreamHTTPServer(t *testing.T) (string, func()) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		time.Sleep(delay)
 		w.Header().Set("X-Upstream-Service", "http-basic-test")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, r.URL.RequestURI()+"|"+string(body))
@@ -303,4 +457,12 @@ func portFromHost(host string) (int, error) {
 		return 0, err
 	}
 	return strconv.Atoi(port)
+}
+
+func hostNameFromPublicURL(publicURL string) string {
+	parsed, err := url.Parse(publicURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }

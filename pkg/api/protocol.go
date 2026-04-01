@@ -17,6 +17,7 @@ const (
 	MessageTypePong       MessageType = "pong"
 	MessageTypeRequest    MessageType = "request"
 	MessageTypeResponse   MessageType = "response"
+	MessageTypeCancel     MessageType = "cancel"
 	MessageTypeError      MessageType = "error"
 	MessageTypeClose      MessageType = "close"
 )
@@ -30,10 +31,12 @@ type Message struct {
 
 // RegisterPayload is sent by the client immediately after connecting.
 type RegisterPayload struct {
-	Protocol  string         `json:"protocol"`
-	LocalPort int            `json:"local_port"`
-	AuthToken string         `json:"auth_token,omitempty"`
-	Metadata  ClientMetadata `json:"metadata,omitempty"`
+	Protocol       string         `json:"protocol"`
+	LocalPort      int            `json:"local_port"`
+	AuthToken      string         `json:"auth_token,omitempty"`
+	Metadata       ClientMetadata `json:"metadata,omitempty"`
+	ResumeTunnelID string         `json:"resume_tunnel_id,omitempty"`
+	ResumeToken    string         `json:"resume_token,omitempty"`
 }
 
 // ClientMetadata describes the connecting CLI instance.
@@ -53,6 +56,8 @@ type RegisteredPayload struct {
 	PublicURL                string `json:"public_url"`
 	Status                   string `json:"status"`
 	HeartbeatIntervalSeconds int    `json:"heartbeat_interval_seconds"`
+	ResumeToken              string `json:"resume_token,omitempty"`
+	Resumed                  bool   `json:"resumed,omitempty"`
 }
 
 // PingPayload keeps a control connection alive.
@@ -81,6 +86,11 @@ type ResponsePayload struct {
 	Status  int                 `json:"status"`
 	Headers map[string][]string `json:"headers,omitempty"`
 	Body    string              `json:"body,omitempty"`
+}
+
+// CancelPayload prepares the protocol for future request cancellation support.
+type CancelPayload struct {
+	Reason string `json:"reason,omitempty"`
 }
 
 // ProtocolErrorPayload reports a protocol-level failure.
@@ -129,6 +139,9 @@ func (p RegisterPayload) Validate() error {
 	}
 	if p.LocalPort < 1 || p.LocalPort > 65535 {
 		return fmt.Errorf("local port %d must be between 1 and 65535", p.LocalPort)
+	}
+	if (p.ResumeTunnelID == "") != (p.ResumeToken == "") {
+		return fmt.Errorf("resume_tunnel_id and resume_token must be provided together")
 	}
 	return nil
 }

@@ -36,7 +36,9 @@ The current scaffold is intentionally modest: it implements a working control pl
 4. `binboi http 3000` connects to the stream listener, sends a `register` message, and receives a `registered` response with tunnel metadata.
 5. The client then sends `ping` heartbeats and the daemon responds with `pong` while updating the in-memory session record.
 6. Incoming HTTP requests are converted into `request` protocol messages, forwarded to the connected client, proxied to the local service, and returned as `response` messages.
-7. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
+7. The server tracks multiple in-flight requests per tunnel by request ID while the client processes request messages concurrently.
+8. When a control connection drops, the client retries with exponential backoff and attempts to resume the same tunnel using a resumable session identity.
+9. Session creation requests are normalized through `transport`, planned through `proxy`, and surfaced through `tunnel`.
 
 ## Why The Implementation Is Intentionally Small
 
@@ -58,7 +60,8 @@ The tunnel and proxy layers therefore expose realistic integration points withou
 - proxy transport adapters
 - metrics and tracing
 - richer client ergonomics
-- multiplexed forwarding and request streaming on top of the established request/response channel
+- chunked or streamed request bodies on top of the current request/response channel
+- richer resume semantics such as expiry windows and request cancellation
 
 ## Design Principles
 

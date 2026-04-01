@@ -26,7 +26,6 @@ type protocolServer struct {
 	mu       sync.RWMutex
 	listener net.Listener
 	peers    map[string]*protocolPeer
-	hosts    map[string]string
 }
 
 func newProtocolServer(address string, heartbeatInterval time.Duration, logger *slog.Logger, manager *session.Manager) *protocolServer {
@@ -36,7 +35,6 @@ func newProtocolServer(address string, heartbeatInterval time.Duration, logger *
 		logger:            logger,
 		manager:           manager,
 		peers:             make(map[string]*protocolPeer),
-		hosts:             make(map[string]string),
 	}
 }
 
@@ -95,12 +93,20 @@ func (s *protocolServer) ForwardRequest(ctx context.Context, host string, reques
 		return api.ResponsePayload{}, errTunnelNotFound
 	}
 
-	peer := s.peerForHost(host)
-	if peer == nil {
+	sessionState, ok := s.manager.LookupByHost(host)
+	if !ok {
 		return api.ResponsePayload{}, errTunnelNotFound
 	}
-	if peer.session.Protocol != "http" && peer.session.Protocol != "https" {
+	if sessionState.Connection != "connected" {
+		return api.ResponsePayload{}, errTunnelUnavailable
+	}
+	if sessionState.Protocol != "http" && sessionState.Protocol != "https" {
 		return api.ResponsePayload{}, errTunnelUnsupported
+	}
+
+	peer := s.peerBySessionID(sessionState.ID)
+	if peer == nil {
+		return api.ResponsePayload{}, errTunnelUnavailable
 	}
 
 	return peer.forward(ctx, request)
@@ -121,8 +127,8 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 
 	defer func() {
 		if sessionID != "" {
-			s.removePeer(sessionID)
-			s.manager.Remove(sessionID)
+			s.removePeer(sessionID, peer)
+			s.manager.DetachConnection(sessionID, time.Now().UTC())
 			if peer != nil {
 				peer.failPending(errTunnelUnavailable)
 			}
@@ -162,27 +168,35 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	registeredSession, err := s.manager.RegisterTunnel(ctx, session.RegisterRequest{
-		Protocol:  register.Protocol,
-		LocalPort: register.LocalPort,
-		AuthToken: register.AuthToken,
-		Metadata:  register.Metadata,
-		Conn:      conn,
+	registerResult, err := s.manager.RegisterTunnel(ctx, session.RegisterRequest{
+		Protocol:       register.Protocol,
+		LocalPort:      register.LocalPort,
+		AuthToken:      register.AuthToken,
+		Metadata:       register.Metadata,
+		Conn:           conn,
+		ResumeTunnelID: register.ResumeTunnelID,
+		ResumeToken:    register.ResumeToken,
 	})
 	if err != nil {
-		s.sendProtocolError(conn, codec, "", "registration_failed", err.Error())
+		errorCode := "registration_failed"
+		if errors.Is(err, session.ErrInvalidResume) {
+			errorCode = "invalid_resume"
+		}
+		s.sendProtocolError(conn, codec, "", errorCode, err.Error())
 		s.logger.Warn("tunnel registration failed",
 			"remote_addr", remoteAddr,
 			"protocol", register.Protocol,
 			"local_port", register.LocalPort,
+			"resume_tunnel_id", register.ResumeTunnelID,
 			"error", err,
 		)
 		return
 	}
 
+	registeredSession := registerResult.Session
 	sessionID = registeredSession.ID
 	localPort = register.LocalPort
-	peer = newProtocolPeer(registeredSession, conn, codec, s.logger)
+	peer = newProtocolPeer(registeredSession, conn, codec, s.logger, s.manager)
 	s.addPeer(peer)
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
@@ -190,6 +204,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	resumeToken, _ := s.manager.ResumeToken(registeredSession.ID)
 	registeredMessage, err := api.NewMessage(api.MessageTypeRegistered, api.RegisteredPayload{
 		TunnelID:                 registeredSession.ID,
 		Protocol:                 registeredSession.Protocol,
@@ -198,6 +213,8 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		PublicURL:                registeredSession.PublicURL,
 		Status:                   registeredSession.Status,
 		HeartbeatIntervalSeconds: int(s.heartbeatInterval / time.Second),
+		ResumeToken:              resumeToken,
+		Resumed:                  registerResult.Resumed,
 	})
 	if err != nil {
 		s.logger.Warn("failed to encode registered response", "tunnel_id", sessionID, "error", err)
@@ -214,6 +231,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 		"protocol", registeredSession.Protocol,
 		"local_port", registeredSession.LocalPort,
 		"public_url", registeredSession.PublicURL,
+		"resumed", registerResult.Resumed,
 	)
 
 	for {
@@ -259,11 +277,6 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 				return
 			}
 
-			s.logger.Debug("received heartbeat ping",
-				"tunnel_id", sessionID,
-				"sequence", ping.Sequence,
-			)
-
 			pongMessage, err := api.NewMessage(api.MessageTypePong, api.PongPayload{
 				Sequence:   ping.Sequence,
 				ReceivedAt: time.Now().UTC(),
@@ -277,11 +290,6 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 				s.logger.Warn("failed to send pong", "tunnel_id", sessionID, "error", err)
 				return
 			}
-
-			s.logger.Debug("sent heartbeat pong",
-				"tunnel_id", sessionID,
-				"sequence", ping.Sequence,
-			)
 		case api.MessageTypeResponse:
 			var response api.ResponsePayload
 			if err := message.Decode(&response); err != nil {
@@ -289,7 +297,7 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 				return
 			}
 			if message.ID == "" || !peer.handleResponse(message.ID, response) {
-				s.logger.Warn("received response for unknown request",
+				s.logger.Warn("received response for unknown or expired request",
 					"tunnel_id", sessionID,
 					"request_id", message.ID,
 				)
@@ -344,35 +352,38 @@ func (s *protocolServer) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *protocolServer) addPeer(peer *protocolPeer) {
-	host := hostFromPublicURL(peer.session.PublicURL)
-
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.peers[peer.session.ID]; ok && existing != peer {
+		existing.failPending(errTunnelUnavailable)
+		_ = existing.conn.Close()
+	}
 	s.peers[peer.session.ID] = peer
-	if host != "" {
-		s.hosts[host] = peer.session.ID
-	}
-	s.mu.Unlock()
 }
 
-func (s *protocolServer) removePeer(sessionID string) {
+func (s *protocolServer) removePeer(sessionID string, peer *protocolPeer) {
 	s.mu.Lock()
-	peer, ok := s.peers[sessionID]
-	if ok {
+	defer s.mu.Unlock()
+
+	current, ok := s.peers[sessionID]
+	if ok && (peer == nil || current == peer) {
 		delete(s.peers, sessionID)
-		delete(s.hosts, hostFromPublicURL(peer.session.PublicURL))
 	}
-	s.mu.Unlock()
 }
 
-func (s *protocolServer) peerForHost(host string) *protocolPeer {
+func (s *protocolServer) peerBySessionID(sessionID string) *protocolPeer {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	sessionID, ok := s.hosts[host]
-	if !ok {
-		return nil
-	}
 	return s.peers[sessionID]
+}
+
+func (s *protocolServer) closePeer(sessionID string) error {
+	peer := s.peerBySessionID(sessionID)
+	if peer == nil {
+		return errTunnelNotFound
+	}
+	return peer.conn.Close()
 }
 
 func (s *protocolServer) sendProtocolError(conn net.Conn, codec *api.MessageCodec, id, code, message string) {

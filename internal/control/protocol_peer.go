@@ -5,16 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/sardorazimov/binboi-go/internal/session"
 	"github.com/sardorazimov/binboi-go/pkg/api"
-	"log/slog"
 )
 
 const forwardTimeout = 30 * time.Second
@@ -35,6 +35,7 @@ type protocolPeer struct {
 	conn    net.Conn
 	codec   *api.MessageCodec
 	logger  *slog.Logger
+	manager *session.Manager
 
 	nextRequestID atomic.Uint64
 
@@ -42,12 +43,13 @@ type protocolPeer struct {
 	pending   map[string]chan forwardResult
 }
 
-func newProtocolPeer(session api.Session, conn net.Conn, codec *api.MessageCodec, logger *slog.Logger) *protocolPeer {
+func newProtocolPeer(session api.Session, conn net.Conn, codec *api.MessageCodec, logger *slog.Logger, manager *session.Manager) *protocolPeer {
 	return &protocolPeer{
 		session: session,
 		conn:    conn,
 		codec:   codec,
 		logger:  logger,
+		manager: manager,
 		pending: make(map[string]chan forwardResult),
 	}
 }
@@ -58,7 +60,9 @@ func (p *protocolPeer) forward(ctx context.Context, request api.RequestPayload) 
 
 	p.pendingMu.Lock()
 	p.pending[requestID] = resultCh
+	inFlight := len(p.pending)
 	p.pendingMu.Unlock()
+	p.manager.SetInFlight(p.session.ID, inFlight)
 
 	message, err := api.NewMessage(api.MessageTypeRequest, request)
 	if err != nil {
@@ -77,6 +81,7 @@ func (p *protocolPeer) forward(ctx context.Context, request api.RequestPayload) 
 		"request_id", requestID,
 		"method", request.Method,
 		"path", request.Path,
+		"in_flight", inFlight,
 	)
 
 	waitCtx, cancel := context.WithTimeout(ctx, forwardTimeout)
@@ -87,6 +92,11 @@ func (p *protocolPeer) forward(ctx context.Context, request api.RequestPayload) 
 		return result.response, result.err
 	case <-waitCtx.Done():
 		p.removePending(requestID)
+		p.logger.Warn("request timed out waiting for tunnel response",
+			"tunnel_id", p.session.ID,
+			"request_id", requestID,
+			"error", waitCtx.Err(),
+		)
 		return api.ResponsePayload{}, waitCtx.Err()
 	}
 }
@@ -114,6 +124,7 @@ func (p *protocolPeer) failPending(err error) {
 	pending := p.pending
 	p.pending = make(map[string]chan forwardResult)
 	p.pendingMu.Unlock()
+	p.manager.SetInFlight(p.session.ID, 0)
 
 	for _, resultCh := range pending {
 		resultCh <- forwardResult{err: err}
@@ -140,13 +151,16 @@ func (p *protocolPeer) takePending(id string) (chan forwardResult, bool) {
 	if ok {
 		delete(p.pending, id)
 	}
+	p.manager.SetInFlight(p.session.ID, len(p.pending))
 	return resultCh, ok
 }
 
 func (p *protocolPeer) removePending(id string) {
 	p.pendingMu.Lock()
 	delete(p.pending, id)
+	remaining := len(p.pending)
 	p.pendingMu.Unlock()
+	p.manager.SetInFlight(p.session.ID, remaining)
 }
 
 func normalizeHost(host string) string {
@@ -158,14 +172,6 @@ func normalizeHost(host string) string {
 		return parsedHost
 	}
 	return host
-}
-
-func hostFromPublicURL(publicURL string) string {
-	parsed, err := url.Parse(publicURL)
-	if err != nil {
-		return ""
-	}
-	return normalizeHost(parsed.Host)
 }
 
 func requestFromHTTP(r *http.Request) (api.RequestPayload, error) {

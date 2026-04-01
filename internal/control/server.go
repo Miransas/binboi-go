@@ -192,6 +192,8 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, errTunnelNotFound):
 			writeError(w, http.StatusNotFound, "no active tunnel for host")
+		case errors.Is(err, errTunnelUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "tunnel is currently disconnected")
 		case errors.Is(err, errTunnelUnsupported):
 			writeError(w, http.StatusNotImplemented, "tunnel protocol does not support HTTP forwarding yet")
 		case errors.Is(err, context.DeadlineExceeded):

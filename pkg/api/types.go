@@ -29,8 +29,11 @@ type Session struct {
 	LocalPort     int        `json:"local_port,omitempty"`
 	PublicURL     string     `json:"public_url"`
 	Status        string     `json:"status"`
+	Connection    string     `json:"connection"`
 	CreatedAt     time.Time  `json:"created_at"`
+	LastSeen      *time.Time `json:"last_seen,omitempty"`
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	InFlight      int        `json:"in_flight,omitempty"`
 	Route         Route      `json:"route"`
 }
 
