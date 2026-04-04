@@ -53,6 +53,9 @@ type AuthConfig struct {
 	DatabasePath                  string `json:"database_path"`
 	CacheTTLSeconds               int    `json:"cache_ttl_seconds"`
 	LastUsedUpdateIntervalSeconds int    `json:"last_used_update_interval_seconds"`
+	RemoteValidateURL             string `json:"remote_validate_url,omitempty"`
+	RemoteValidateSecret          string `json:"remote_validate_secret,omitempty"`
+	RemoteValidateTimeoutSeconds  int    `json:"remote_validate_timeout_seconds,omitempty"`
 }
 
 // ObservabilityConfig controls basic logging output.
@@ -86,6 +89,7 @@ func Default() Config {
 			DatabasePath:                  "./data/binboi-tokens.json",
 			CacheTTLSeconds:               30,
 			LastUsedUpdateIntervalSeconds: 60,
+			RemoteValidateTimeoutSeconds:  5,
 		},
 		Usage: usage.Config{
 			DatabasePath:         "./data/binboi-usage.json",
@@ -193,6 +197,14 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Auth.LastUsedUpdateIntervalSeconds <= 0 {
 		return errors.New("auth.last_used_update_interval_seconds must be greater than zero")
+	}
+	if cfg.Auth.RemoteValidateURL != "" {
+		if cfg.Auth.RemoteValidateSecret == "" {
+			return errors.New("auth.remote_validate_secret is required when auth.remote_validate_url is set")
+		}
+		if cfg.Auth.RemoteValidateTimeoutSeconds <= 0 {
+			return errors.New("auth.remote_validate_timeout_seconds must be greater than zero when auth.remote_validate_url is set")
+		}
 	}
 	if err := cfg.Usage.Validate(); err != nil {
 		return fmt.Errorf("usage: %w", err)

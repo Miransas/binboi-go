@@ -89,10 +89,17 @@ func runDaemon(args []string) error {
 		return fmt.Errorf("initialize usage store: %w", err)
 	}
 
-	tokenValidator := auth.NewValidator(tokenStore, auth.ValidatorConfig{
+	var tokenValidator control.TokenValidator = auth.NewValidator(tokenStore, auth.ValidatorConfig{
 		CacheTTL:               time.Duration(cfg.Auth.CacheTTLSeconds) * time.Second,
 		LastUsedUpdateInterval: time.Duration(cfg.Auth.LastUsedUpdateIntervalSeconds) * time.Second,
 	}, logger)
+	if cfg.Auth.RemoteValidateURL != "" {
+		tokenValidator = auth.NewRemoteValidator(cfg.Auth.RemoteValidateURL, auth.RemoteValidatorConfig{
+			SharedSecret: cfg.Auth.RemoteValidateSecret,
+			Timeout:      time.Duration(cfg.Auth.RemoteValidateTimeoutSeconds) * time.Second,
+			CacheTTL:     time.Duration(cfg.Auth.CacheTTLSeconds) * time.Second,
+		}, logger)
+	}
 	usageTracker := usage.NewTracker(usageStore, cfg.Usage, logger)
 
 	manager := session.NewManagerWithStore(cfg.Tunnel.PublicHost, cfg.Proxy.ForwardedHeader, tunnelStore)
@@ -125,6 +132,7 @@ func runDaemon(args []string) error {
 		"public_host", cfg.Tunnel.PublicHost,
 		"tunnel_database_path", cfg.Tunnel.DatabasePath,
 		"auth_database_path", cfg.Auth.DatabasePath,
+		"auth_remote_validate_url", cfg.Auth.RemoteValidateURL,
 		"usage_database_path", cfg.Usage.DatabasePath,
 		"usage_flush_interval", time.Duration(cfg.Usage.FlushIntervalSeconds)*time.Second,
 		"usage_period", cfg.Usage.Period,
