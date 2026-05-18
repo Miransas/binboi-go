@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # 🦬 Next.js / TypeScript SaaS Platformu Paketleri
+  - package-ecosystem: "npm"
+    directory: "/web" # Web arayüzünün olduğu dizin
+    schedule:
+      interval: "weekly" # Haftalık güncellemeleri kontrol eder
+    open-pull-requests-limit: 5
+
+  # 🦬 Go Core Tünel ve Sunucu Bağımlılıkları (go.mod)
+  - package-ecosystem: "gomod"
+    directory: "/" # Kök dizindeki Go modülünü kontrol eder
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
